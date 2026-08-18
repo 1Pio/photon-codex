@@ -3,6 +3,7 @@ import { EventEmitter } from "node:events";
 import readline from "node:readline";
 
 const REQUEST_TIMEOUT_MS = 30_000;
+export const FAST_SERVICE_TIER = "fast";
 
 export class CodexAppServer extends EventEmitter {
   constructor({ cwd, threadId = null, onThreadId }) {
@@ -13,6 +14,7 @@ export class CodexAppServer extends EventEmitter {
     this.process = null;
     this.nextId = 1;
     this.pending = new Map();
+    this.serviceTier = null;
   }
 
   async start() {
@@ -104,8 +106,10 @@ export class CodexAppServer extends EventEmitter {
           approvalPolicy: "never",
           sandbox: "workspace-write",
           developerInstructions: developerInstructions(),
+          serviceTier: FAST_SERVICE_TIER,
         });
         this.threadId = result.thread?.id || this.threadId;
+        this.serviceTier = result.serviceTier || this.serviceTier;
         await this.onThreadId(this.threadId);
         return this.threadId;
       } catch (error) {
@@ -121,12 +125,14 @@ export class CodexAppServer extends EventEmitter {
       approvalPolicy: "never",
       sandbox: "workspace-write",
       developerInstructions: developerInstructions(),
+      serviceTier: FAST_SERVICE_TIER,
       serviceName: "photon-codex",
       sessionStartSource: "startup",
       threadSource: "user",
     });
     this.threadId = result.thread?.id;
     if (!this.threadId) throw new Error("Codex did not return a thread ID");
+    this.serviceTier = result.serviceTier || this.serviceTier;
     return this.threadId;
   }
 
@@ -138,6 +144,7 @@ export class CodexAppServer extends EventEmitter {
       cwd: this.cwd,
       approvalPolicy: "never",
       effort: "medium",
+      serviceTier: FAST_SERVICE_TIER,
       summary: "concise",
     });
     await this.onThreadId(this.threadId);

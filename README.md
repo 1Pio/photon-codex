@@ -10,6 +10,7 @@ It is deliberately one process and one runtime dependency surface. Photon stream
 - Images as native Codex `localImage` inputs
 - Other attachments as private local files that Codex can inspect
 - Persistent Codex thread resumption
+- Fast Codex service tier requested explicitly and reported by app-server as `priority`
 - Active-turn steering when another iMessage arrives
 - Direct-message and exact-sender isolation
 - Message-ID deduplication across restarts

@@ -249,6 +249,7 @@ export class Bridge {
       running: true,
       pid: process.pid,
       threadId: this.codex?.threadId || this.state.threadId,
+      serviceTier: this.codex?.serviceTier,
       spaceBound: Boolean(this.state.spaceId),
       activeTurnId: this.activeTurnId,
       seenMessages: this.state.seenMessageIds.length,

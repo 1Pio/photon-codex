@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { normalizePhone, safeName, splitMessage } from "../src/bridge.js";
-import { CodexAppServer } from "../src/codex.js";
+import { CodexAppServer, FAST_SERVICE_TIER } from "../src/codex.js";
 import { normalizeSender } from "../src/config.js";
 
 test("normalizes E.164 input without weakening validation", () => {
@@ -24,15 +24,16 @@ test("splits long replies without losing text", () => {
 test("starts each turn on the loaded thread without resuming again", async () => {
   const saved = [];
   const codex = new CodexAppServer({ cwd: "/tmp", threadId: "thread-1", onThreadId: async (id) => saved.push(id) });
-  const methods = [];
-  codex.request = async (method) => {
-    methods.push(method);
+  const requests = [];
+  codex.request = async (method, params) => {
+    requests.push({ method, params });
     return { turn: { id: "turn-1" } };
   };
 
   await codex.startTurn([{ type: "text", text: "hello" }]);
 
-  assert.deepEqual(methods, ["turn/start"]);
+  assert.deepEqual(requests.map(({ method }) => method), ["turn/start"]);
+  assert.equal(requests[0].params.serviceTier, FAST_SERVICE_TIER);
   assert.deepEqual(saved, ["thread-1"]);
 });
 
@@ -59,4 +60,34 @@ test("fails closed when a persisted Codex thread cannot resume", async () => {
 
   await assert.rejects(() => codex.ensureThread(), /Cannot resume Codex thread thread-missing/);
   assert.deepEqual(methods, ["thread/resume"]);
+});
+
+test("resumes persisted threads in fast service mode", async () => {
+  const codex = new CodexAppServer({ cwd: "/tmp", threadId: "thread-1", onThreadId: async () => {} });
+  let request;
+  codex.request = async (method, params) => {
+    request = { method, params };
+    return { thread: { id: "thread-1" }, serviceTier: "priority" };
+  };
+
+  await codex.ensureThread();
+
+  assert.equal(request.method, "thread/resume");
+  assert.equal(request.params.serviceTier, FAST_SERVICE_TIER);
+  assert.equal(codex.serviceTier, "priority");
+});
+
+test("requests fast service and records app-server priority mode", async () => {
+  const codex = new CodexAppServer({ cwd: "/tmp", onThreadId: async () => {} });
+  let request;
+  codex.request = async (method, params) => {
+    request = { method, params };
+    return { thread: { id: "thread-fast" }, serviceTier: "priority" };
+  };
+
+  await codex.newThread();
+
+  assert.equal(request.method, "thread/start");
+  assert.equal(request.params.serviceTier, FAST_SERVICE_TIER);
+  assert.equal(codex.serviceTier, "priority");
 });
