@@ -1,6 +1,7 @@
 import { spawn } from "node:child_process";
 import { EventEmitter } from "node:events";
 import { existsSync } from "node:fs";
+import { createRequire } from "node:module";
 import os from "node:os";
 import path from "node:path";
 import readline from "node:readline";
@@ -8,6 +9,7 @@ import readline from "node:readline";
 const REQUEST_TIMEOUT_MS = 30_000;
 
 const MACOS_CODEX_BIN = "/Applications/ChatGPT.app/Contents/Resources/codex";
+const PACKAGE_VERSION = createRequire(import.meta.url)("../package.json").version;
 
 export class CodexAppServer extends EventEmitter {
   constructor({ cwd, threadId = null, ephemeral = false, env = process.env, transportInstructions = null, onThreadId }) {
@@ -52,7 +54,7 @@ export class CodexAppServer extends EventEmitter {
     if (this.env.PHOTON_CODEX_DEBUG === "1") this.process.stderr.pipe(process.stderr);
     readline.createInterface({ input: this.process.stdout }).on("line", (line) => this.#onLine(line));
     await this.request("initialize", {
-      clientInfo: { name: "photon-codex", title: "Photon Codex", version: "0.4.0" },
+      clientInfo: { name: "photon-codex", title: "Photon Codex", version: PACKAGE_VERSION },
       capabilities: {
         experimentalApi: true,
       },
@@ -271,7 +273,9 @@ export function codexExecutable(env = process.env) {
 }
 
 export function codexEnvironment(env = process.env) {
-  return Object.fromEntries(Object.entries(env).filter(([name]) => !name.startsWith("PHOTON_")));
+  const child = Object.fromEntries(Object.entries(env).filter(([name]) => !name.startsWith("PHOTON_")));
+  if (env.PHOTON_CODEX_HOME) child.PHOTON_CODEX_HOME = path.resolve(env.PHOTON_CODEX_HOME);
+  return child;
 }
 
 export function codexHome(env = process.env) {

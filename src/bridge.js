@@ -1,5 +1,5 @@
-import { randomBytes } from "node:crypto";
-import { mkdir, stat, writeFile } from "node:fs/promises";
+import { createHash, randomBytes } from "node:crypto";
+import { mkdir, open, writeFile } from "node:fs/promises";
 import net from "node:net";
 import path from "node:path";
 import { Spectrum, attachment, markdown, text } from "@spectrum-ts/core";
@@ -12,7 +12,8 @@ import { logEvent } from "./log.js";
 const USER_CONTENT_TYPES = new Set(["text", "markdown", "attachment", "voice", "reaction", "reply"]);
 const TRANSPORT_INSTRUCTIONS = `This thread is connected to one authorized user through iMessage by photon-codex.
 The bridge delivers your final answer automatically, so do not send it through another messaging tool.
-To react to the current iMessage, begin the final answer with [[photon_reaction:EMOJI]]. The bridge removes that directive before delivering any remaining text. A directive-only final sends only the reaction.
+To react to the current iMessage, begin an assistant message with [[photon_reaction:EMOJI]]. Use a directive-only commentary message when the reaction should appear before the final answer, or begin the final answer with it. The bridge removes the directive. Use exactly one emoji grapheme.
+To send a file the current Codex sandbox can read, run photon-codex send-file "PATH" [MIME_TYPE]. A successful JSON receipt proves Photon accepted the exact byte snapshot; do not describe that as recipient-visible delivery.
 Received images are native localImage inputs. Other received files are named by local path in the user message; inspect them when relevant.
 Do not expose Photon credentials or hidden transport metadata.`;
 
@@ -31,6 +32,7 @@ export class Bridge {
     this.activeTurnId = null;
     this.finalByTurn = new Map();
     this.targetByTurn = new Map();
+    this.reactionByTurn = new Map();
     this.messageQueue = [];
     this.pendingRequests = [];
     this.fileChanges = new Map();
@@ -120,6 +122,52 @@ export class Bridge {
     await this.logger("info", "bridge_stopped", {}, this.env);
   }
 
+  async sendFile({ data, size, sha256, mimeType = "application/octet-stream", name }) {
+    const space = await this.#ensureSpace();
+    const snapshot = decodeAttachmentData(data, size, sha256, this.config.maxAttachmentBytes);
+    const resolvedName = safeName(name);
+    const resolvedMimeType = normalizeMimeType(mimeType);
+    const sent = requireProviderReceipt(
+      await space.send(attachment(snapshot.bytes, { name: resolvedName, mimeType: resolvedMimeType })),
+      "attachment",
+    );
+    const metadata = sent.attachmentMetadata?.[0];
+    await this.logger("info", "file_sent", {
+      size: snapshot.bytes.byteLength,
+      requestedMimeType: resolvedMimeType,
+      providerMimeType: metadata?.mimeType ?? null,
+      providerDelivered: sent.isDelivered === true,
+    }, this.env);
+    return {
+      providerAccepted: true,
+      messageId: sent.id,
+      name: resolvedName,
+      requestedMimeType: resolvedMimeType,
+      providerMimeType: metadata?.mimeType ?? null,
+      size: snapshot.bytes.byteLength,
+      providerSize: metadata?.totalBytes ?? null,
+      sha256: snapshot.sha256,
+      isSent: sent.isSent ?? null,
+      isDelivered: sent.isDelivered ?? null,
+      transferState: metadata?.transferState ?? null,
+    };
+  }
+
+  async reactToMessage({ messageId, emoji }) {
+    const space = await this.#ensureSpace();
+    const message = await space.getMessage(requiredText(messageId));
+    if (!message) throw new Error("message not found");
+    const reaction = normalizeReaction(emoji);
+    const sent = requireProviderReceipt(await message.react(reaction), "reaction");
+    await this.logger("info", "reaction_sent", { phase: "control" }, this.env);
+    return {
+      providerAccepted: true,
+      targetMessageId: message.id,
+      receiptId: sent.id,
+      emoji: reaction,
+    };
+  }
+
   async handleMessage(space, message) {
     const disposition = messageDisposition(space, message, this.config, this.state);
     if (!disposition.accept) {
@@ -142,7 +190,7 @@ export class Bridge {
     const replyTargetId = message.content?.type === "reply" ? message.content.target?.id : null;
     if (replyTargetId && this.expiredPromptIds.has(replyTargetId)) {
       await message.read().catch(() => {});
-      await retryTransient(() => message.reply("That Codex prompt has already resolved. Please send a new request."));
+      await message.reply("That Codex prompt has already resolved. Please send a new request.");
       await this.#recordAccepted(message.id, "expired-codex-interaction");
       return;
     }
@@ -278,7 +326,7 @@ export class Bridge {
     const space = await this.#ensureSpace();
     const chunks = splitApprovalPrompt(formatServerRequest(request), 3500);
     for (const chunk of chunks) {
-      const sent = await retryTransient(() => space.send(text(chunk)));
+      const sent = await space.send(text(chunk));
       if (sent?.id) request.promptIds.push(sent.id);
     }
   }
@@ -289,17 +337,17 @@ export class Bridge {
     await message.read().catch(() => {});
     const replyTargetId = message.content?.type === "reply" ? message.content.target?.id : null;
     if (replyTargetId && !request.promptIds.includes(replyTargetId)) {
-      await retryTransient(() => message.reply("That reply targets a different Codex prompt. Reply to the current prompt instead."));
+      await message.reply("That reply targets a different Codex prompt. Reply to the current prompt instead.");
       await this.#recordAccepted(message.id, contentType);
       return;
     }
     if (request.requiresThreadedReply && !request.promptIds.includes(replyTargetId)) {
-      await retryTransient(() => message.reply("Reply directly to the pending Codex prompt before it expires."));
+      await message.reply("Reply directly to the pending Codex prompt before it expires.");
       await this.#recordAccepted(message.id, contentType);
       return;
     }
     if (!text) {
-      await retryTransient(() => message.reply("Please answer the pending Codex prompt with text."));
+      await message.reply("Please answer the pending Codex prompt with text.");
       await this.#recordAccepted(message.id, contentType);
       return;
     }
@@ -307,7 +355,7 @@ export class Bridge {
     try {
       result = resolveServerRequest(request, text);
     } catch (error) {
-      await retryTransient(() => message.reply(error.message));
+      await message.reply(error.message);
       await this.#recordAccepted(message.id, contentType);
       return;
     }
@@ -341,8 +389,17 @@ export class Bridge {
       return;
     }
     if (method === "item/completed" && params.item?.type === "agentMessage") {
+      const message = params.item.text?.trim() || "";
+      const outbound = parseOutboundResponse(stripInternal(message));
+      if (params.item.phase !== "final_answer" && outbound.reaction) {
+        const target = this.targetByTurn.get(params.turnId);
+        if (target) await this.#attemptReaction(params.turnId, target, outbound.reaction, "commentary");
+      }
+      if (outbound.reactionError) {
+        await this.logger("warn", "reaction_directive_invalid", { phase: params.item.phase || "unknown" }, this.env);
+      }
       if (params.item.phase === "final_answer" || !this.finalByTurn.has(params.turnId)) {
-        this.finalByTurn.set(params.turnId, params.item.text?.trim() || "");
+        this.finalByTurn.set(params.turnId, message);
       }
       return;
     }
@@ -351,40 +408,80 @@ export class Bridge {
     const turnId = params.turn?.id || this.activeTurnId;
     const target = this.targetByTurn.get(turnId);
     const final = this.finalByTurn.get(turnId) || finalFromTurn(params.turn);
+    let reactionState = this.reactionByTurn.get(turnId);
     this.activeTurnId = null;
     this.targetByTurn.delete(turnId);
     this.finalByTurn.delete(turnId);
     await this.space?.stopTyping().catch(() => {});
     if (!target) {
+      this.reactionByTurn.delete(turnId);
       await this.#startQueuedTurn();
       return;
     }
-    if (params.turn?.status === "completed" && final) {
+    if (params.turn?.status === "completed" && (final || reactionState)) {
       const outbound = parseOutboundResponse(stripInternal(final));
-      if (outbound.reaction) await retryTransient(() => target.react(outbound.reaction));
+      if (outbound.reactionError) {
+        await this.logger("warn", "reaction_directive_invalid", { phase: "final_answer" }, this.env);
+      }
+      if (outbound.reaction && !reactionState) {
+        reactionState = await this.#attemptReaction(turnId, target, outbound.reaction, "final_answer");
+      }
       const chunks = splitMessage(outbound.text);
-      if (chunks.length) await retryTransient(() => target.reply(markdown(chunks[0])));
-      for (const chunk of chunks.slice(1)) await retryTransient(() => target.space.send(markdown(chunk)));
+      if (chunks.length) await target.reply(markdown(chunks[0]));
+      for (const chunk of chunks.slice(1)) await target.space.send(markdown(chunk));
+      if (!chunks.length && reactionState && !reactionState.sent) {
+        await target.reply(text(reactionState.emoji));
+      } else if (!chunks.length && outbound.reactionError) {
+        await target.reply(text("I could not send that reaction."));
+      }
+      this.reactionByTurn.delete(turnId);
       await this.#recordReply(target.id);
       await this.#startQueuedTurn();
       return;
     }
-    await retryTransient(() => target.reply("I could not finish that Codex turn. Please try again."));
+    this.reactionByTurn.delete(turnId);
+    await target.reply("I could not finish that Codex turn. Please try again.");
     await this.#recordReply(target.id);
     await this.#startQueuedTurn();
+  }
+
+  async #attemptReaction(turnId, target, emoji, phase) {
+    const existing = this.reactionByTurn.get(turnId);
+    if (existing) return existing;
+    const state = { emoji, sent: false };
+    this.reactionByTurn.set(turnId, state);
+    try {
+      const sent = requireProviderReceipt(await target.react(emoji), "reaction");
+      state.sent = true;
+      state.messageId = sent.id;
+      await this.logger("info", "reaction_sent", { phase }, this.env);
+    } catch (error) {
+      await this.logger("warn", "reaction_failed", { phase, error: cleanError(error) }, this.env);
+    }
+    return state;
   }
 
   async #startControlServer() {
     const token = randomBytes(24).toString("base64url");
     this.controlServer = net.createServer((socket) => {
       let buffer = "";
+      let receivedBytes = 0;
+      let settled = false;
       socket.setEncoding("utf8");
       socket.on("data", (chunk) => {
+        if (settled) return;
+        receivedBytes += Buffer.byteLength(chunk);
+        if (receivedBytes > controlRequestLimit(this.config.maxAttachmentBytes)) {
+          settled = true;
+          socket.end(`${JSON.stringify({ ok: false, error: "control request exceeds the configured attachment limit" })}\n`);
+          return;
+        }
         buffer += chunk;
         const newline = buffer.indexOf("\n");
         if (newline === -1) return;
         const line = buffer.slice(0, newline);
         buffer = "";
+        settled = true;
         void this.#handleControl(line).then(
           (result) => socket.end(`${JSON.stringify({ ok: true, result })}\n`),
           (error) => socket.end(`${JSON.stringify({ ok: false, error: error.message })}\n`),
@@ -421,25 +518,13 @@ export class Bridge {
       return { messageId: sent?.id || null };
     }
     if (request.command === "send-file") {
-      const file = path.resolve(requiredText(request.file));
-      const fileStat = await stat(file);
-      if (!fileStat.isFile()) throw new Error("attachment path is not a regular file");
-      if (fileStat.size > this.config.maxAttachmentBytes) {
-        throw new Error(`attachment exceeds ${this.config.maxAttachmentBytes} bytes`);
-      }
-      const name = safeName(request.name || path.basename(file));
-      const mimeType = requiredText(request.mimeType || "application/octet-stream");
-      const sent = await space.send(attachment(file, { name, mimeType }));
-      return { messageId: sent?.id || null, name, size: fileStat.size };
+      return this.sendFile(request);
     }
+    if (request.command === "react") return this.reactToMessage(request);
     const message = await space.getMessage(requiredText(request.messageId));
     if (!message) throw new Error("message not found");
     if (request.command === "reply") {
       const sent = await message.reply(markdown(requiredText(request.text)));
-      return { messageId: sent?.id || null };
-    }
-    if (request.command === "react") {
-      const sent = await message.react(requiredText(request.emoji));
       return { messageId: sent?.id || null };
     }
     throw new Error(`unknown command: ${request.command}`);
@@ -570,8 +655,46 @@ export function normalizePhone(value) {
 }
 
 export function safeName(value) {
-  const clean = String(value || "file").replace(/[^a-zA-Z0-9._-]+/g, "_").replace(/^\.+/, "");
-  return clean.slice(0, 160) || "file";
+  const base = String(value || "file").normalize("NFC").split(/[\\/]/).pop();
+  const clean = base.replace(/[\u0000-\u001F\u007F:]+/g, "_").replace(/\p{Bidi_Control}/gu, "_").replace(/^\.+/, "").trim() || "file";
+  if (Buffer.byteLength(clean) <= 240) return clean;
+  const extension = path.extname(clean);
+  const safeExtension = Buffer.byteLength(extension) <= 32 ? extension : "";
+  return `${truncateUtf8(clean.slice(0, clean.length - safeExtension.length), 240 - Buffer.byteLength(safeExtension))}${safeExtension}`;
+}
+
+const REACTION_ALIASES = new Map([
+  ["love", "❤️"],
+  ["heart", "❤️"],
+  ["like", "👍"],
+  ["thumbsup", "👍"],
+  ["+1", "👍"],
+  ["dislike", "👎"],
+  ["thumbsdown", "👎"],
+  ["-1", "👎"],
+  ["laugh", "😂"],
+  ["emphasize", "‼️"],
+  ["question", "❓"],
+]);
+const GRAPHEME_SEGMENTER = new Intl.Segmenter("en", { granularity: "grapheme" });
+const EMOJI_PATTERN = /\p{Extended_Pictographic}|\p{Regional_Indicator}|\u20E3/u;
+
+export function normalizeReaction(value) {
+  const raw = requiredText(value).normalize("NFC");
+  const reaction = REACTION_ALIASES.get(raw.toLowerCase()) || raw;
+  const graphemes = Array.from(GRAPHEME_SEGMENTER.segment(reaction), ({ segment }) => segment);
+  if (graphemes.length !== 1 || !EMOJI_PATTERN.test(reaction)) {
+    throw new Error("reaction must be exactly one emoji");
+  }
+  return reaction;
+}
+
+export function normalizeMimeType(value) {
+  const mimeType = requiredText(value).toLowerCase();
+  if (!/^[a-z0-9][a-z0-9!#$&^_.+-]*\/[a-z0-9][a-z0-9!#$&^_.+-]*$/.test(mimeType)) {
+    throw new Error("attachment MIME type must be a valid MIME type (type/subtype)");
+  }
+  return mimeType;
 }
 
 export function splitMessage(text, limit = 4000) {
@@ -629,12 +752,104 @@ function isLowSurrogate(code) {
 
 export function parseOutboundResponse(text) {
   const source = String(text || "").trim();
-  const directive = source.match(/^\[\[photon_reaction:(.{1,16})\]\](?:\n|$)/u);
-  if (!directive) return { reaction: null, text: source };
-  return {
-    reaction: directive[1].trim() || null,
-    text: source.slice(directive[0].length).trim(),
-  };
+  const prefix = "[[photon_reaction:";
+  if (!source.startsWith(prefix)) return { reaction: null, text: source };
+  const close = source.indexOf("]]", prefix.length);
+  const lineBreak = source.search(/[\r\n]/);
+  if (close === -1 || (lineBreak !== -1 && close > lineBreak)) {
+    const remainder = lineBreak === -1 ? "" : source.slice(lineBreak + 1).trim();
+    return { reaction: null, text: remainder, reactionError: "reaction directive is incomplete" };
+  }
+  const remainder = source.slice(close + 2).replace(/^[ \t]*(?:\r?\n)?/, "").trim();
+  try {
+    return { reaction: normalizeReaction(source.slice(prefix.length, close)), text: remainder };
+  } catch (error) {
+    return { reaction: null, text: remainder, reactionError: cleanError(error) };
+  }
+}
+
+export async function snapshotFile(file, maxBytes) {
+  const resolvedFile = path.resolve(requiredText(file));
+  let handle;
+  try {
+    handle = await open(resolvedFile, "r");
+  } catch {
+    throw new Error("attachment file could not be opened");
+  }
+  try {
+    const fileStat = await handle.stat();
+    if (!fileStat.isFile()) throw new Error("attachment path is not a regular file");
+    if (fileStat.size > maxBytes) throw new Error(`attachment exceeds ${maxBytes} bytes`);
+    const chunks = [];
+    let size = 0;
+    let position = 0;
+    while (true) {
+      const chunk = Buffer.allocUnsafe(Math.min(64 * 1024, maxBytes - size + 1));
+      const { bytesRead } = await handle.read(chunk, 0, chunk.byteLength, position);
+      if (bytesRead === 0) break;
+      size += bytesRead;
+      if (size > maxBytes) throw new Error(`attachment exceeds ${maxBytes} bytes`);
+      chunks.push(chunk.subarray(0, bytesRead));
+      position += bytesRead;
+    }
+    const bytes = Buffer.concat(chunks, size);
+    return {
+      bytes,
+      file: resolvedFile,
+      name: path.basename(resolvedFile),
+      size,
+      sha256: createHash("sha256").update(bytes).digest("hex"),
+    };
+  } finally {
+    await handle.close();
+  }
+}
+
+function decodeAttachmentData(data, claimedSize, claimedSha256, maxBytes) {
+  if (typeof data !== "string") throw new Error("encoded attachment data is required");
+  if (data.length > Math.ceil(maxBytes / 3) * 4) throw new Error(`attachment exceeds ${maxBytes} bytes`);
+  if (!/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/.test(data)) {
+    throw new Error("attachment data must be canonical base64");
+  }
+  const bytes = Buffer.from(data, "base64");
+  if (bytes.byteLength > maxBytes) throw new Error(`attachment exceeds ${maxBytes} bytes`);
+  if (!Number.isSafeInteger(claimedSize) || claimedSize < 0 || claimedSize !== bytes.byteLength) {
+    throw new Error("attachment size does not match the caller snapshot");
+  }
+  const sha256 = createHash("sha256").update(bytes).digest("hex");
+  if (!/^[a-f0-9]{64}$/.test(claimedSha256) || claimedSha256 !== sha256) {
+    throw new Error("attachment SHA-256 does not match the caller snapshot");
+  }
+  return { bytes, sha256 };
+}
+
+export function controlRequestLimit(maxAttachmentBytes) {
+  return Math.ceil(maxAttachmentBytes / 3) * 4 + 16 * 1024;
+}
+
+function requireProviderReceipt(message, kind) {
+  if (!message?.id) throw new Error(`Photon did not return a ${kind} message receipt`);
+  // iMessage reaction writes return target-message delivery flags, not reaction
+  // delivery flags; the non-throwing write plus returned ID is the receipt.
+  if (kind !== "reaction" && message.isSent === false) {
+    throw new Error(`Photon reported that the ${kind} was not sent`);
+  }
+  if (typeof message.sendErrorCode === "number" && message.sendErrorCode !== 0) {
+    throw new Error(`Photon reported that the ${kind} was not sent`);
+  }
+  if (message.attachmentMetadata?.some(({ transferState }) => transferState === "failed")) {
+    throw new Error("Photon reported that the attachment transfer failed");
+  }
+  return message;
+}
+
+function truncateUtf8(value, maxBytes) {
+  let output = "";
+  for (const { segment } of GRAPHEME_SEGMENTER.segment(value)) {
+    if (Buffer.byteLength(output) + Buffer.byteLength(segment) > maxBytes) break;
+    output += segment;
+  }
+  return output;
 }
 
 function textInput(text) {
@@ -673,25 +888,6 @@ function requiredText(value) {
   const text = String(value || "").trim();
   if (!text) throw new Error("value is required");
   return text;
-}
-
-async function retryTransient(action) {
-  const delays = [0, 250, 1000];
-  let lastError;
-  for (const delay of delays) {
-    if (delay) await new Promise((resolve) => setTimeout(resolve, delay));
-    try {
-      return await action();
-    } catch (error) {
-      lastError = error;
-      if (!isTransient(error)) break;
-    }
-  }
-  throw lastError;
-}
-
-function isTransient(error) {
-  return /(?:ECONNRESET|ETIMEDOUT|fetch failed|network|temporar|unavailable|rate.?limit|\b429\b|timeout)/i.test(error?.message || "");
 }
 
 function cleanError(error) {

@@ -4,7 +4,18 @@ import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
-import { Bridge, normalizePhone, parseOutboundResponse, safeName, splitApprovalPrompt, splitMessage } from "../src/bridge.js";
+import {
+  Bridge,
+  controlRequestLimit,
+  normalizeMimeType,
+  normalizePhone,
+  normalizeReaction,
+  parseOutboundResponse,
+  safeName,
+  snapshotFile,
+  splitApprovalPrompt,
+  splitMessage,
+} from "../src/bridge.js";
 import { CodexAppServer, codexEnvironment, codexExecutable } from "../src/codex.js";
 import {
   emptyState,
@@ -68,7 +79,11 @@ test("ignores legacy Codex overrides in Photon config", async () => {
 });
 
 test("sanitizes inbound filenames", () => {
-  assert.equal(safeName("../../private file.pdf"), "_.._private_file.pdf");
+  assert.equal(safeName("../../private file.pdf"), "private file.pdf");
+  assert.equal(safeName("../設計資料.pdf"), "設計資料.pdf");
+  const longName = safeName(`${"ü".repeat(200)}.pdf`);
+  assert.equal(longName.endsWith(".pdf"), true);
+  assert.equal(Buffer.byteLength(longName) <= 240, true);
   assert.equal(safeName(""), "file");
 });
 
@@ -96,6 +111,195 @@ test("extracts a private Photon reaction directive from a response", () => {
     text: "Working on it.",
   });
   assert.deepEqual(parseOutboundResponse("Normal reply"), { reaction: null, text: "Normal reply" });
+});
+
+test("handles adjacent text and never exposes a malformed private reaction directive", () => {
+  assert.deepEqual(parseOutboundResponse("[[photon_reaction:🧐]]Short answer."), {
+    reaction: "🧐",
+    text: "Short answer.",
+  });
+  assert.deepEqual(parseOutboundResponse("[[photon_reaction:👍]]\r\nAcknowledged."), {
+    reaction: "👍",
+    text: "Acknowledged.",
+  });
+  assert.deepEqual(parseOutboundResponse("[[photon_reaction:👍👍]]\nStill answering."), {
+    reaction: null,
+    text: "Still answering.",
+    reactionError: "reaction must be exactly one emoji",
+  });
+  assert.deepEqual(parseOutboundResponse("[[photon_reaction:👍\nStill answering."), {
+    reaction: null,
+    text: "Still answering.",
+    reactionError: "reaction directive is incomplete",
+  });
+});
+
+test("accepts one complete emoji grapheme and a strict MIME type", () => {
+  assert.equal(normalizeReaction("👨‍💻"), "👨‍💻");
+  assert.equal(normalizeReaction("🇦🇪"), "🇦🇪");
+  assert.equal(normalizeReaction("like"), "👍");
+  assert.throws(() => normalizeReaction("👍👍"), /exactly one emoji/);
+  assert.equal(normalizeMimeType("Application/PDF"), "application/pdf");
+  assert.throws(() => normalizeMimeType("application/pdf\r\nX-Test: yes"), /valid MIME type/);
+});
+
+test("snapshots and fingerprints an outbound file before Spectrum reads it", async () => {
+  const home = await mkdtemp(path.join(os.tmpdir(), "photon-codex-send-file-"));
+  const file = path.join(home, "brief.pdf");
+  const original = Buffer.from("fixed attachment bytes");
+  let built;
+  try {
+    await writeFile(file, original);
+    const bridge = new Bridge({
+      config: { projectId: "project", allowedSender: "+15551234567", cwd: home, maxAttachmentBytes: 1024 },
+      projectSecret: "secret",
+    });
+    bridge.state = { ...emptyState(), spaceId: "space-1" };
+    bridge.space = {
+      id: "space-1",
+      send: async (builder) => {
+        built = await builder.build();
+        return {
+          id: "sent-file-1",
+          isSent: true,
+          attachmentMetadata: [{ mimeType: "application/pdf", totalBytes: original.byteLength, transferState: "finished" }],
+        };
+      },
+    };
+
+    const snapshot = await snapshotFile(file, 1024);
+    await writeFile(file, "mutated after validation");
+    const receipt = await bridge.sendFile({
+      data: snapshot.bytes.toString("base64"),
+      size: snapshot.size,
+      sha256: snapshot.sha256,
+      name: snapshot.name,
+      mimeType: "application/pdf",
+    });
+
+    assert.equal((await built.read()).compare(original), 0);
+    assert.deepEqual(receipt, {
+      providerAccepted: true,
+      messageId: "sent-file-1",
+      name: "brief.pdf",
+      requestedMimeType: "application/pdf",
+      providerMimeType: "application/pdf",
+      size: original.byteLength,
+      providerSize: original.byteLength,
+      sha256: "e0887f3b0291ef2f856a3f4fe74b545c205d609cd16fecea76c186e197c28a5e",
+      isSent: true,
+      isDelivered: null,
+      transferState: "finished",
+    });
+  } finally {
+    await rm(home, { recursive: true, force: true });
+  }
+});
+
+test("fails outbound files closed on size and missing provider receipts", async () => {
+  const home = await mkdtemp(path.join(os.tmpdir(), "photon-codex-send-file-fail-"));
+  let sends = 0;
+  try {
+    const file = path.join(home, "too-large.bin");
+    await writeFile(file, "12345");
+    const bridge = new Bridge({
+      config: { projectId: "project", allowedSender: "+15551234567", cwd: home, maxAttachmentBytes: 4 },
+      projectSecret: "secret",
+    });
+    bridge.state = { ...emptyState(), spaceId: "space-1" };
+    bridge.space = { id: "space-1", send: async () => { sends += 1; return undefined; } };
+
+    await assert.rejects(() => snapshotFile(file, 4), /exceeds 4 bytes/);
+    const snapshot = await snapshotFile(file, 1024);
+    await assert.rejects(() => bridge.sendFile({
+      data: snapshot.bytes.toString("base64"),
+      size: snapshot.size,
+      sha256: snapshot.sha256,
+      name: snapshot.name,
+    }), /exceeds 4 bytes/);
+    assert.equal(sends, 0);
+    bridge.config.maxAttachmentBytes = 1024;
+    await assert.rejects(() => bridge.sendFile({
+      data: snapshot.bytes.toString("base64"),
+      size: snapshot.size,
+      sha256: snapshot.sha256,
+      name: snapshot.name,
+    }), /did not return.*message receipt/);
+    assert.equal(sends, 1);
+  } finally {
+    await rm(home, { recursive: true, force: true });
+  }
+});
+
+test("keeps path reads in the caller and validates the loopback byte envelope", async () => {
+  const home = await mkdtemp(path.join(os.tmpdir(), "photon-codex-send-file-scope-"));
+  try {
+    const boundary = path.join(home, "boundary.txt");
+    await writeFile(boundary, "1234");
+    const bridge = new Bridge({
+      config: { projectId: "project", allowedSender: "+15551234567", cwd: home, maxAttachmentBytes: 4 },
+      projectSecret: "secret",
+    });
+    bridge.state = { ...emptyState(), spaceId: "space-1" };
+    bridge.space = { id: "space-1", send: async () => ({ id: "boundary-message" }) };
+    const snapshot = await snapshotFile(boundary, 4);
+
+    assert.equal((await bridge.sendFile({
+      data: snapshot.bytes.toString("base64"),
+      size: snapshot.size,
+      sha256: snapshot.sha256,
+      name: snapshot.name,
+    })).size, 4);
+    await assert.rejects(() => bridge.sendFile({ file: boundary }), /encoded attachment data is required/);
+    await assert.rejects(() => bridge.sendFile({
+      data: snapshot.bytes.toString("base64"),
+      size: snapshot.size,
+      sha256: "0".repeat(64),
+      name: snapshot.name,
+    }), /SHA-256 does not match/);
+    await assert.rejects(() => bridge.sendFile({
+      data: "!!!!",
+      size: 3,
+      sha256: snapshot.sha256,
+      name: snapshot.name,
+    }), /canonical base64/);
+    await assert.rejects(() => bridge.sendFile({
+      data: snapshot.bytes.toString("base64"),
+      size: 3,
+      sha256: snapshot.sha256,
+      name: snapshot.name,
+    }), /size does not match/);
+    await assert.rejects(() => snapshotFile(home, 4), /not a regular file/);
+    assert.equal(controlRequestLimit(4), 16_392);
+  } finally {
+    await rm(home, { recursive: true, force: true });
+  }
+});
+
+test("normalizes aliases and requires a provider receipt for direct reactions", async () => {
+  const seen = [];
+  const bridge = new Bridge({
+    config: { projectId: "project", allowedSender: "+15551234567", cwd: "/tmp", maxAttachmentBytes: 1024 },
+    projectSecret: "secret",
+    logger: async () => {},
+  });
+  bridge.state = { ...emptyState(), spaceId: "space-1" };
+  bridge.space = {
+    getMessage: async () => ({ id: "message-1", react: async (emoji) => { seen.push(emoji); return { id: "reaction-1", isSent: false }; } }),
+  };
+
+  assert.deepEqual(await bridge.reactToMessage({ messageId: "message-1", emoji: "like" }), {
+    providerAccepted: true,
+    targetMessageId: "message-1",
+    receiptId: "reaction-1",
+    emoji: "👍",
+  });
+  assert.deepEqual(seen, ["👍"]);
+  bridge.space.getMessage = async () => ({ react: async () => undefined });
+  await assert.rejects(
+    () => bridge.reactToMessage({ messageId: "message-1", emoji: "👍" }),
+    /did not return.*reaction.*receipt/,
+  );
 });
 
 test("ignores Photon read receipts before starting a Codex turn", async () => {
@@ -183,7 +387,7 @@ test("accepts one user message and records one successful reply", async () => {
       timestamp: new Date("2026-08-19T00:00:00.000Z"),
       content: { type: "text", text: "hello" },
       read: async () => {},
-      react: async (emoji) => { reactions.push(emoji); },
+      react: async (emoji) => { reactions.push(emoji); return { id: "reaction-1" }; },
       reply: async (content) => { replies.push(content); },
       space,
     };
@@ -202,6 +406,118 @@ test("accepts one user message and records one successful reply", async () => {
     assert.deepEqual(bridge.state.repliedMessageIds, ["message-1"]);
     assert.equal(bridge.state.runtime.acceptedMessages, 1);
     assert.equal(bridge.state.runtime.repliesSent, 1);
+  } finally {
+    await rm(home, { recursive: true, force: true });
+  }
+});
+
+test("a failed reaction never suppresses the answer text", async () => {
+  const home = await mkdtemp(path.join(os.tmpdir(), "photon-codex-reaction-failure-"));
+  const events = [];
+  const replies = [];
+  let attempts = 0;
+  try {
+    const bridge = new Bridge({
+      config: { projectId: "project", allowedSender: "+15551234567", cwd: home, maxAttachmentBytes: 1024 },
+      projectSecret: "secret",
+      env: { ...process.env, PHOTON_CODEX_HOME: home },
+      logger: async (level, event) => events.push({ level, event }),
+    });
+    bridge.state = { ...emptyState(), spaceId: "space-1" };
+    bridge.space = { stopTyping: async () => {} };
+    bridge.activeTurnId = "turn-1";
+    bridge.finalByTurn.set("turn-1", "[[photon_reaction:🧐]]Answer still arrives.");
+    bridge.targetByTurn.set("turn-1", {
+      id: "message-1",
+      react: async () => { attempts += 1; throw new Error("reaction unavailable"); },
+      reply: async (content) => { replies.push(await content.build()); return { id: "reply-1" }; },
+      space: { send: async () => ({ id: "reply-part" }) },
+    });
+
+    await bridge.handleCodexNotification("turn/completed", {
+      turn: { id: "turn-1", status: "completed", items: [] },
+    });
+
+    assert.equal(replies[0].markdown, "Answer still arrives.");
+    assert.equal(attempts, 1);
+    assert.equal(events.some(({ event }) => event === "reaction_failed"), true);
+    assert.deepEqual(bridge.state.repliedMessageIds, ["message-1"]);
+  } finally {
+    await rm(home, { recursive: true, force: true });
+  }
+});
+
+test("a commentary reaction is sent once before the final answer", async () => {
+  const home = await mkdtemp(path.join(os.tmpdir(), "photon-codex-early-reaction-"));
+  const reactions = [];
+  const replies = [];
+  try {
+    const bridge = new Bridge({
+      config: { projectId: "project", allowedSender: "+15551234567", cwd: home, maxAttachmentBytes: 1024 },
+      projectSecret: "secret",
+      env: { ...process.env, PHOTON_CODEX_HOME: home },
+      logger: async () => {},
+    });
+    bridge.state = { ...emptyState(), spaceId: "space-1" };
+    bridge.space = { stopTyping: async () => {} };
+    bridge.activeTurnId = "turn-1";
+    bridge.targetByTurn.set("turn-1", {
+      id: "message-1",
+      react: async (emoji) => { reactions.push(emoji); return { id: "reaction-1" }; },
+      reply: async (content) => { replies.push(await content.build()); return { id: "reply-1" }; },
+      space: { send: async () => ({ id: "reply-part" }) },
+    });
+
+    await bridge.handleCodexNotification("item/completed", {
+      turnId: "turn-1",
+      item: { type: "agentMessage", phase: "commentary", text: "[[photon_reaction:🫡️]]" },
+    });
+    assert.deepEqual(reactions, ["🫡️"]);
+    assert.equal(replies.length, 0);
+
+    await bridge.handleCodexNotification("item/completed", {
+      turnId: "turn-1",
+      item: { type: "agentMessage", phase: "final_answer", text: "Finished." },
+    });
+    await bridge.handleCodexNotification("turn/completed", {
+      turn: { id: "turn-1", status: "completed", items: [] },
+    });
+
+    assert.deepEqual(reactions, ["🫡️"]);
+    assert.equal(replies[0].markdown, "Finished.");
+  } finally {
+    await rm(home, { recursive: true, force: true });
+  }
+});
+
+test("a failed reaction-only response falls back to visible emoji text", async () => {
+  const home = await mkdtemp(path.join(os.tmpdir(), "photon-codex-reaction-fallback-"));
+  let fallback;
+  try {
+    const bridge = new Bridge({
+      config: { projectId: "project", allowedSender: "+15551234567", cwd: home, maxAttachmentBytes: 1024 },
+      projectSecret: "secret",
+      env: { ...process.env, PHOTON_CODEX_HOME: home },
+      logger: async () => {},
+    });
+    bridge.state = { ...emptyState(), spaceId: "space-1" };
+    bridge.space = { stopTyping: async () => {} };
+    bridge.activeTurnId = "turn-1";
+    bridge.finalByTurn.set("turn-1", "[[photon_reaction:🥦]]");
+    bridge.targetByTurn.set("turn-1", {
+      id: "message-1",
+      react: async () => undefined,
+      reply: async (content) => { fallback = await content.build(); return { id: "reply-1" }; },
+      space: { send: async () => ({ id: "reply-part" }) },
+    });
+
+    await bridge.handleCodexNotification("turn/completed", {
+      turn: { id: "turn-1", status: "completed", items: [] },
+    });
+
+    assert.equal(fallback.type, "text");
+    assert.equal(fallback.text, "🥦");
+    assert.deepEqual(bridge.state.repliedMessageIds, ["message-1"]);
   } finally {
     await rm(home, { recursive: true, force: true });
   }
@@ -715,7 +1031,7 @@ test("supports the complete standard MCP enum and format schema families", () =>
   assert.throws(() => resolveServerRequest(request, "email=invalid\nmode=safe\ntags=one"), /valid email/);
 });
 
-test("removes Photon-only values from the Codex child environment", () => {
+test("removes Photon credentials but preserves the non-secret control home", () => {
   assert.deepEqual(codexEnvironment({
     PATH: "/usr/bin",
     CODEX_HOME: "/tmp/codex-home",
@@ -724,6 +1040,7 @@ test("removes Photon-only values from the Codex child environment", () => {
   }), {
     PATH: "/usr/bin",
     CODEX_HOME: "/tmp/codex-home",
+    PHOTON_CODEX_HOME: "/tmp/photon-home",
   });
 });
 

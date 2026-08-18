@@ -17,7 +17,7 @@ It is deliberately one process and one runtime dependency surface. Photon stream
 - Provider receipt/status events ignored before Codex starts
 - Separate accepted-message and successful-reply state
 - Message-ID deduplication across restarts
-- Text and file sends, threaded replies, and reactions through one CLI
+- Text and exact-byte file sends, threaded replies, and native or custom emoji reactions through one CLI
 - A small, restart-on-failure macOS service
 - Bounded, content-free operational logging
 - Photon telemetry disabled by default
@@ -59,6 +59,8 @@ Configuration, private attachments, a bounded operational log, and small runtime
 
 Codex settings do not belong in this file. The bridge starts Codex app-server without model, reasoning, service-tier, approval, sandbox, personality, summary, or generic config overrides. App-server resolves the normal Codex layers from `$CODEX_HOME/config.toml` and trusted project `.codex/config.toml` files for `cwd`, exactly as Codex does in its other local clients. On macOS, photon-codex prefers the Codex executable bundled with the installed ChatGPT desktop app so its protocol and feature version match the app; set `PHOTON_CODEX_BIN` only when you deliberately want another executable.
 
+Photon credentials and project identifiers are removed from the Codex child environment. The only Photon-specific value retained is the non-secret `PHOTON_CODEX_HOME` locator when configured, so an agent's `photon-codex send-file` and reaction commands reach the same local bridge.
+
 Run `photon-codex doctor` after changing Codex configuration, then `photon-codex service restart`. Doctor launches an ephemeral app-server thread, reads the effective config through the native `config/read` API, and compares every corresponding field reported by the thread, including model, reasoning effort, service tier, approval policy, reviewer, sandbox network policy, and workspace. `photon-codex status` exposes the same scoped inheritance report for the live persistent thread and distinguishes mismatches from fields an older resumed thread does not report. Legacy `reasoningEffort` and `fastMode` fields are ignored and removed the next time photon-codex writes `config.json`.
 
 `state.json` contains the persistent Codex thread, bound conversation, bounded accepted/replied/ignored event IDs, truthful counters, and the current loopback control endpoint. The Photon secret is not stored in either file or in the service definition.
@@ -71,9 +73,9 @@ The first accepted direct message from the configured sender binds the bridge to
 photon-codex status
 photon-codex logs 50
 photon-codex send "Hello"
-photon-codex send-file /path/to/document.pdf application/pdf
+photon-codex send-file "/path/to/document.pdf" application/pdf
 photon-codex reply MESSAGE_ID "Got it"
-photon-codex react MESSAGE_ID like
+photon-codex react MESSAGE_ID 👍
 photon-codex thread new
 photon-codex stop
 photon-codex workspace set /path/to/workspace
@@ -82,7 +84,9 @@ photon-codex service restart
 
 All control commands print structured JSON. They talk only to the locally running bridge over a token-authenticated loopback connection. `status` reports process and service health, the native Codex config parity result, authenticated account type, pending Codex prompts, queued messages, delivery counters, and the last safe operational error. It does not treat ingestion as proof of delivery.
 
-`send-file` delivers a local document or other file through the bound Photon conversation. Codex can also react to the current iMessage with a private response directive; the bridge sends the emoji reaction and removes the directive before delivering any remaining answer text.
+`send-file` opens the file once in the calling CLI process, enforces the configured limit while reading, and sends an authenticated size-and-hash-checked byte envelope to the service. Photon receives that in-memory snapshot, never a mutable path. This keeps file access subject to the caller's normal Codex sandbox instead of turning the unsandboxed service into a way around it. The receipt includes the Photon message ID, byte count, SHA-256, requested MIME type, and the provider-reported MIME type when available. Spectrum's iMessage transport derives the actual provider type from the preserved filename rather than forwarding the requested MIME field. `providerAccepted: true` means Photon's write completed; only delivery metadata or observation in Messages establishes recipient delivery.
+
+Reactions accept one emoji grapheme. The classic Tapbacks `❤️`, `👍`, `👎`, `😂`, `‼️`, and `❓` use their native iMessage forms; other emoji use iMessage custom reactions. The CLI also accepts the aliases `love`, `like`, `dislike`, `laugh`, `emphasize`, and `question`. Codex can place a private reaction directive in commentary for an immediate acknowledgement or at the start of its final answer. The directive is always removed, including when malformed. A failed reaction never blocks answer text, and a failed reaction-only response falls back to the emoji as ordinary text.
 
 The operational log is `~/.config/photon-codex/runtime.log`. It records event types and health outcomes, never message bodies, phone numbers, conversation IDs, credentials, or attachment contents. It rotates at 512 KiB and retains one previous file.
 
@@ -111,4 +115,4 @@ npm test
 npm run doctor
 ```
 
-Codex app-server is the official open-source embedding interface used for threads, turns, approvals, history, and streamed agent events. See the [Codex app-server documentation](https://learn.chatgpt.com/docs/app-server) and [openai/codex source](https://github.com/openai/codex/tree/main/codex-rs/app-server).
+Codex app-server is the official open-source embedding interface used for threads, turns, approvals, history, and streamed agent events. See the [Codex app-server documentation](https://learn.chatgpt.com/docs/app-server) and [openai/codex source](https://github.com/openai/codex/tree/main/codex-rs/app-server). The media implementation follows Photon's documented [Spectrum reactions and replies](https://photon.codes/docs/spectrum-ts/reactions-and-replies) and [Advanced iMessage attachment](https://github.com/photon-hq/advanced-imessage-ts#send-attachments) contracts.

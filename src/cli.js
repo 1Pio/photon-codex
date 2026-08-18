@@ -6,7 +6,7 @@ import net from "node:net";
 import path from "node:path";
 import { createInterface } from "node:readline/promises";
 import { stdin, stdout } from "node:process";
-import { Bridge } from "./bridge.js";
+import { Bridge, snapshotFile } from "./bridge.js";
 import { CodexAppServer, codexExecutable, codexHome } from "./codex.js";
 import {
   loadConfig,
@@ -244,7 +244,15 @@ async function workspaceSet(args) {
 async function sendFile(args) {
   const file = path.resolve(requiredText(args[0]));
   const mimeType = args[1] || "application/octet-stream";
-  print(await control("send-file", { file, mimeType, name: path.basename(file) }));
+  const config = await loadConfig();
+  const snapshot = await snapshotFile(file, config.maxAttachmentBytes);
+  print(await control("send-file", {
+    data: snapshot.bytes.toString("base64"),
+    size: snapshot.size,
+    sha256: snapshot.sha256,
+    mimeType,
+    name: snapshot.name,
+  }));
 }
 
 async function serviceInstall() {
@@ -277,7 +285,9 @@ async function control(command, body = {}) {
     const socket = net.createConnection({ host: "127.0.0.1", port: state.control.port });
     let response = "";
     socket.setEncoding("utf8");
-    socket.setTimeout(3000, () => socket.destroy(new Error("control request timed out")));
+    if (command !== "send-file") {
+      socket.setTimeout(3000, () => socket.destroy(new Error("control request timed out")));
+    }
     socket.on("connect", () => socket.write(`${JSON.stringify({ token: state.control.token, command, ...body })}\n`));
     socket.on("data", (chunk) => { response += chunk; });
     socket.on("end", () => {
