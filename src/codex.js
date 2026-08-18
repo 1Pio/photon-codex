@@ -15,10 +15,12 @@ export class CodexAppServer extends EventEmitter {
     this.nextId = 1;
     this.pending = new Map();
     this.serviceTier = null;
+    this.stopping = false;
   }
 
   async start() {
     if (this.process) return;
+    this.stopping = false;
     this.process = spawn("codex", ["app-server", "--listen", "stdio://"], {
       cwd: this.cwd,
       stdio: ["pipe", "pipe", "pipe"],
@@ -26,20 +28,20 @@ export class CodexAppServer extends EventEmitter {
     this.process.once("error", (error) => {
       for (const pending of this.pending.values()) pending.reject(error);
       this.pending.clear();
-      this.emit("exit", error);
+      if (!this.stopping) this.emit("exit", error);
       this.process = null;
     });
     this.process.once("exit", (code, signal) => {
       const error = new Error(`codex app-server exited (${code ?? signal})`);
       for (const pending of this.pending.values()) pending.reject(error);
       this.pending.clear();
-      this.emit("exit", error);
+      if (!this.stopping) this.emit("exit", error);
       this.process = null;
     });
     if (process.env.PHOTON_CODEX_DEBUG === "1") this.process.stderr.pipe(process.stderr);
     readline.createInterface({ input: this.process.stdout }).on("line", (line) => this.#onLine(line));
     await this.request("initialize", {
-      clientInfo: { name: "photon-codex", title: "Photon Codex", version: "0.1.0" },
+      clientInfo: { name: "photon-codex", title: "Photon Codex", version: "0.2.0" },
       capabilities: null,
     });
     this.notify("initialized", {});
@@ -48,8 +50,20 @@ export class CodexAppServer extends EventEmitter {
 
   async stop() {
     if (!this.process) return;
-    this.process.kill("SIGTERM");
-    this.process = null;
+    this.stopping = true;
+    const child = this.process;
+    await new Promise((resolve) => {
+      const timer = setTimeout(() => {
+        child.kill("SIGKILL");
+        resolve();
+      }, 5000);
+      child.once("exit", () => {
+        clearTimeout(timer);
+        resolve();
+      });
+      child.kill("SIGTERM");
+    });
+    if (this.process === child) this.process = null;
   }
 
   #onLine(line) {
@@ -104,7 +118,7 @@ export class CodexAppServer extends EventEmitter {
           threadId: this.threadId,
           cwd: this.cwd,
           approvalPolicy: "never",
-          sandbox: "workspace-write",
+          sandboxPolicy: workspaceSandbox(this.cwd),
           developerInstructions: developerInstructions(),
           serviceTier: FAST_SERVICE_TIER,
         });
@@ -123,7 +137,7 @@ export class CodexAppServer extends EventEmitter {
     const result = await this.request("thread/start", {
       cwd: this.cwd,
       approvalPolicy: "never",
-      sandbox: "workspace-write",
+      sandboxPolicy: workspaceSandbox(this.cwd),
       developerInstructions: developerInstructions(),
       serviceTier: FAST_SERVICE_TIER,
       serviceName: "photon-codex",
@@ -143,6 +157,7 @@ export class CodexAppServer extends EventEmitter {
       input,
       cwd: this.cwd,
       approvalPolicy: "never",
+      sandboxPolicy: workspaceSandbox(this.cwd),
       effort: "medium",
       serviceTier: FAST_SERVICE_TIER,
       summary: "concise",
@@ -158,6 +173,14 @@ export class CodexAppServer extends EventEmitter {
       input,
     });
   }
+}
+
+function workspaceSandbox(cwd) {
+  return {
+    type: "workspaceWrite",
+    writableRoots: [cwd],
+    networkAccess: false,
+  };
 }
 
 function developerInstructions() {

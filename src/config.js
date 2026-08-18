@@ -17,8 +17,16 @@ export function statePath(env = process.env) {
   return path.join(appHome(env), "state.json");
 }
 
+export function workspacePath(env = process.env) {
+  return path.join(appHome(env), "workspace");
+}
+
 export function attachmentsPath(env = process.env) {
   return path.join(appHome(env), "attachments");
+}
+
+export function runtimeLogPath(env = process.env) {
+  return path.join(appHome(env), "runtime.log");
 }
 
 export async function ensureHome(env = process.env) {
@@ -59,7 +67,7 @@ export async function loadConfig(env = process.env) {
   const config = {
     projectId: env.PHOTON_PROJECT_ID || stored.projectId,
     allowedSender: env.PHOTON_CODEX_ALLOWED_SENDER || stored.allowedSender,
-    cwd: path.resolve(env.PHOTON_CODEX_CWD || stored.cwd || process.cwd()),
+    cwd: path.resolve(env.PHOTON_CODEX_CWD || stored.cwd || workspacePath(env)),
     maxAttachmentBytes: Number(env.PHOTON_CODEX_MAX_ATTACHMENT_BYTES || stored.maxAttachmentBytes || 50 * 1024 * 1024),
   };
   if (!config.projectId) throw new Error("Photon project ID is missing. Run `photon-codex init`.");
@@ -85,27 +93,69 @@ export async function saveConfig(config, env = process.env) {
 
 export function emptyState() {
   return {
-    version: 1,
+    version: 2,
     threadId: null,
     spaceId: null,
-    seenMessageIds: [],
+    acceptedMessageIds: [],
+    repliedMessageIds: [],
+    ignoredEventIds: [],
     control: null,
+    runtime: {
+      startedAt: null,
+      stoppedAt: null,
+      lastEventAt: null,
+      lastReplyAt: null,
+      lastErrorAt: null,
+      lastError: null,
+      acceptedMessages: 0,
+      repliesSent: 0,
+      repliesFailed: 0,
+      ignoredEvents: 0,
+    },
   };
 }
 
 export async function loadState(env = process.env) {
   await ensureHome(env);
-  return { ...emptyState(), ...(await readJson(statePath(env), emptyState())) };
+  return normalizeState(await readJson(statePath(env), emptyState()));
 }
 
 export async function saveState(state, env = process.env) {
-  const next = {
-    ...emptyState(),
-    ...state,
-    seenMessageIds: Array.from(new Set(state.seenMessageIds || [])).slice(-512),
-  };
+  const next = normalizeState(state);
   await writeJson(statePath(env), next);
   return next;
+}
+
+export function normalizeState(state = {}) {
+  const defaults = emptyState();
+  const legacyIds = Array.isArray(state.seenMessageIds) ? state.seenMessageIds : [];
+  const legacyReceipts = legacyIds.filter(isReceiptEventId);
+  const acceptedMessageIds = state.acceptedMessageIds || legacyIds.filter((id) => !isReceiptEventId(id));
+  const ignoredEventIds = state.ignoredEventIds || legacyReceipts;
+  const runtime = { ...defaults.runtime, ...(state.runtime || {}) };
+  if (!state.runtime) {
+    runtime.acceptedMessages = acceptedMessageIds.length;
+    runtime.ignoredEvents = ignoredEventIds.length;
+  }
+  return {
+    ...defaults,
+    ...state,
+    version: 2,
+    acceptedMessageIds: boundedIds(acceptedMessageIds),
+    repliedMessageIds: boundedIds(state.repliedMessageIds),
+    ignoredEventIds: boundedIds(ignoredEventIds),
+    runtime,
+    control: state.control || null,
+    seenMessageIds: undefined,
+  };
+}
+
+function boundedIds(ids) {
+  return Array.from(new Set(Array.isArray(ids) ? ids : [])).slice(-512);
+}
+
+function isReceiptEventId(id) {
+  return /:(?:read|delivered|delivery):/i.test(String(id || ""));
 }
 
 export function readProjectSecret(projectId, env = process.env) {
