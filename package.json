@@ -1,6 +1,6 @@
 {
   "name": "photon-codex",
-  "version": "0.5.0",
+  "version": "0.6.0",
   "description": "A small, direct bridge between Photon iMessage and a persistent Codex thread.",
   "type": "module",
   "files": [
@@ -15,7 +15,8 @@
   "scripts": {
     "start": "node src/cli.js run",
     "doctor": "node src/cli.js doctor",
-    "test": "node --test"
+    "test": "node --test test/core.test.js",
+    "test:live": "node --test test/live-app-server.js"
   },
   "engines": {
     "node": ">=20"

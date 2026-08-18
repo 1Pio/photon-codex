@@ -10,9 +10,17 @@ const REQUEST_TIMEOUT_MS = 30_000;
 
 const MACOS_CODEX_BIN = "/Applications/ChatGPT.app/Contents/Resources/codex";
 const PACKAGE_VERSION = createRequire(import.meta.url)("../package.json").version;
+const NATIVE_REASONING_EFFORTS = new Set(["low", "medium", "high", "xhigh", "max"]);
+const DISPLAY_REASONING_EFFORT = new Map([
+  ["low", "light"],
+  ["medium", "medium"],
+  ["high", "high"],
+  ["xhigh", "extra high"],
+  ["max", "max"],
+]);
 
 export class CodexAppServer extends EventEmitter {
-  constructor({ cwd, threadId = null, ephemeral = false, env = process.env, transportInstructions = null, onThreadId }) {
+  constructor({ cwd, threadId = null, ephemeral = false, env = process.env, transportInstructions = null, codexOverrides = {}, onThreadId }) {
     super();
     this.cwd = path.resolve(cwd);
     this.threadId = threadId;
@@ -20,11 +28,13 @@ export class CodexAppServer extends EventEmitter {
     this.env = env;
     this.executable = codexExecutable(env);
     this.transportInstructions = transportInstructions;
+    this.codexOverrides = codexOverrides;
     this.onThreadId = onThreadId;
     this.process = null;
     this.nextId = 1;
     this.pending = new Map();
     this.effectiveConfig = null;
+    this.modelPerformanceDefaults = {};
     this.threadSettings = null;
     this.account = null;
     this.stopping = false;
@@ -33,7 +43,7 @@ export class CodexAppServer extends EventEmitter {
   async start() {
     if (this.process) return;
     this.stopping = false;
-    this.process = spawn(this.executable, ["app-server", "--listen", "stdio://"], {
+    this.process = spawn(this.executable, codexAppServerArgs(this.codexOverrides), {
       cwd: this.cwd,
       env: codexEnvironment(this.env),
       stdio: ["pipe", "pipe", "pipe"],
@@ -66,6 +76,10 @@ export class CodexAppServer extends EventEmitter {
     ]);
     this.effectiveConfig = configResult.config || {};
     this.account = accountSummary(accountResult);
+    if (this.effectiveConfig.model_reasoning_effort == null || this.effectiveConfig.service_tier == null) {
+      const models = await this.request("model/list", { limit: 100, includeHidden: true });
+      this.modelPerformanceDefaults = modelPerformanceDefaults(this.effectiveConfig, models.data || []);
+    }
     await this.ensureThread();
   }
 
@@ -153,10 +167,12 @@ export class CodexAppServer extends EventEmitter {
       const result = await this.request("thread/resume", {
         threadId: this.threadId,
         cwd: this.cwd,
+        ...resumePerformanceParams(effectivePerformance(this.effectiveConfig, this.modelPerformanceDefaults)),
       });
       this.threadId = result.thread?.id || this.threadId;
       this.#captureThreadSettings(result);
-      if (this.parityReport().mismatches.length) return this.newThread();
+      const parity = this.parityReport();
+      if (!parity.effectiveVerified) return this.newThread();
       await this.onThreadId(this.threadId);
       return this.threadId;
     } catch (error) {
@@ -168,13 +184,20 @@ export class CodexAppServer extends EventEmitter {
     const result = await this.request("thread/start", {
       cwd: this.cwd,
       ...(this.ephemeral ? { ephemeral: true } : {}),
+      ...resumePerformanceParams(effectivePerformance(this.effectiveConfig, this.modelPerformanceDefaults)),
     });
     this.threadId = result.thread?.id;
     if (!this.threadId) throw new Error("Codex did not return a thread ID");
     this.#captureThreadSettings(result);
     const parity = this.parityReport();
-    if (parity.mismatches.length) {
-      throw new Error(`Codex config parity check failed: ${parity.mismatches.join(", ")}`);
+    if (!parity.effectiveVerified) {
+      const failures = [
+        ...parity.mismatches,
+        ...Object.entries(parity.performance)
+          .filter(([, value]) => !value.verified)
+          .map(([setting]) => `${setting} unverified`),
+      ];
+      throw new Error(`Codex config parity check failed: ${Array.from(new Set(failures)).join(", ")}`);
     }
     if (this.transportInstructions) {
       await this.request("thread/inject_items", {
@@ -215,14 +238,15 @@ export class CodexAppServer extends EventEmitter {
   parityReport() {
     const config = this.effectiveConfig || {};
     const settings = this.threadSettings || {};
+    const expectedPerformance = effectivePerformance(config, this.modelPerformanceDefaults);
     const checks = [];
     const unreported = [];
     compareReported(checks, unreported, "cwd", this.cwd, settings.cwd, normalizePath);
     compareReported(checks, unreported, "model", config.model, settings.model);
     compareReported(checks, unreported, "modelProvider", config.model_provider, settings.modelProvider);
-    compareReported(checks, unreported, "reasoningEffort", config.model_reasoning_effort, settings.effort);
+    compareReported(checks, unreported, "reasoningEffort", expectedPerformance.reasoningEffort, settings.effort);
     compareReported(checks, unreported, "reasoningSummary", config.model_reasoning_summary, settings.summary);
-    compareReported(checks, unreported, "serviceTier", config.service_tier, settings.serviceTier, normalizeServiceTier);
+    compareReported(checks, unreported, "serviceTier", expectedPerformance.serviceTier, settings.serviceTier, normalizeServiceTier);
     compareReported(checks, unreported, "approvalPolicy", config.approval_policy, settings.approvalPolicy);
     compareReported(checks, unreported, "approvalsReviewer", config.approvals_reviewer, settings.approvalsReviewer);
     compareReported(checks, unreported, "sandboxMode", config.sandbox_mode, sandboxMode(settings.sandboxPolicy));
@@ -233,14 +257,28 @@ export class CodexAppServer extends EventEmitter {
       compareReported(checks, unreported, "personality", config.personality, settings.personality);
     }
     const mismatches = checks.filter((check) => !check.matches).map((check) => check.setting);
-    const inherited = Boolean(this.effectiveConfig && this.threadSettings && mismatches.length === 0);
+    const performance = performanceReport(this.codexOverrides, config, settings, expectedPerformance);
+    const overriddenSettings = new Set([
+      ...(Object.hasOwn(this.codexOverrides, "reasoningEffort") ? ["reasoningEffort"] : []),
+      ...(Object.hasOwn(this.codexOverrides, "fastMode") ? ["serviceTier"] : []),
+    ]);
+    const inherited = Boolean(this.effectiveConfig && this.threadSettings
+      && checks.filter((check) => !overriddenSettings.has(check.setting)).every((check) => check.matches));
+    const effectiveVerified = inherited && mismatches.length === 0 && performanceVerified(performance);
     return {
       inherited,
-      verified: inherited && unreported.length === 0,
-      source: "Codex native configuration",
-      overrides: [],
+      effectiveVerified,
+      verified: effectiveVerified && unreported.length === 0,
+      source: Object.keys(this.codexOverrides).length
+        ? "Codex native configuration with photon-codex performance overrides"
+        : "Codex native configuration",
+      overrides: [
+        ...(Object.hasOwn(this.codexOverrides, "reasoningEffort") ? ["reasoningEffort"] : []),
+        ...(Object.hasOwn(this.codexOverrides, "fastMode") ? ["fastMode"] : []),
+      ],
       mismatches,
       unreported,
+      performance,
       config: this.configSummary(),
       thread: summarizeThreadSettings(settings),
     };
@@ -270,6 +308,21 @@ export function codexExecutable(env = process.env) {
   }
   if (process.platform === "darwin" && existsSync(MACOS_CODEX_BIN)) return MACOS_CODEX_BIN;
   return "codex";
+}
+
+export function codexAppServerArgs(overrides = {}) {
+  const args = ["app-server", "--listen", "stdio://"];
+  if (Object.hasOwn(overrides, "reasoningEffort")) {
+    if (!NATIVE_REASONING_EFFORTS.has(overrides.reasoningEffort)) {
+      throw new Error("Invalid native Codex reasoning effort override");
+    }
+    args.push("--config", `model_reasoning_effort=${JSON.stringify(overrides.reasoningEffort)}`);
+  }
+  if (Object.hasOwn(overrides, "fastMode")) {
+    if (typeof overrides.fastMode !== "boolean") throw new Error("Invalid Codex fast mode override");
+    args.push("--config", `service_tier=${JSON.stringify(overrides.fastMode ? "fast" : "default")}`);
+  }
+  return args;
 }
 
 export function codexEnvironment(env = process.env) {
@@ -311,6 +364,66 @@ function summarizeThreadSettings(settings = {}) {
     sandboxMode: sandboxMode(settings.sandboxPolicy),
     sandboxPolicy: settings.sandboxPolicy ?? null,
     personality: settings.personality ?? null,
+  };
+}
+
+function performanceReport(overrides, config, settings, expected) {
+  const reasoningOverride = Object.hasOwn(overrides, "reasoningEffort");
+  const fastOverride = Object.hasOwn(overrides, "fastMode");
+  const configTier = normalizeServiceTier(config.service_tier);
+  const threadTier = normalizeServiceTier(settings.serviceTier);
+  const expectedTier = normalizeServiceTier(expected.serviceTier);
+  const expectedEffort = expected.reasoningEffort;
+  return {
+    reasoningEffort: {
+      source: reasoningOverride ? "override" : "native",
+      configured: reasoningOverride ? DISPLAY_REASONING_EFFORT.get(overrides.reasoningEffort) : null,
+      effective: expectedEffort ?? null,
+      thread: settings.effort ?? null,
+      verified: expectedEffort == null
+        ? settings.effort == null
+        : (!reasoningOverride || config.model_reasoning_effort === expectedEffort) && settings.effort === expectedEffort,
+    },
+    fastMode: {
+      source: fastOverride ? "override" : "native",
+      configured: fastOverride ? overrides.fastMode : null,
+      effective: expectedTier === "priority",
+      serviceTier: expectedTier ?? null,
+      threadServiceTier: threadTier ?? null,
+      verified: expectedTier == null
+        ? threadTier == null
+        : (!fastOverride || configTier === expectedTier) && threadTier === expectedTier,
+    },
+  };
+}
+
+function performanceVerified(performance) {
+  return Object.values(performance || {}).every((value) => value.verified);
+}
+
+function resumePerformanceParams(performance = {}) {
+  return {
+    ...(performance.serviceTier != null ? { serviceTier: performance.serviceTier } : {}),
+    ...(performance.reasoningEffort != null ? {
+      config: { model_reasoning_effort: performance.reasoningEffort },
+    } : {}),
+  };
+}
+
+function effectivePerformance(config = {}, defaults = {}) {
+  return {
+    reasoningEffort: config.model_reasoning_effort ?? defaults.reasoningEffort ?? null,
+    serviceTier: config.service_tier ?? defaults.serviceTier ?? null,
+  };
+}
+
+export function modelPerformanceDefaults(config, models) {
+  const model = config.model == null
+    ? models.find((entry) => entry.isDefault)
+    : models.find((entry) => entry.model === config.model || entry.id === config.model);
+  return {
+    reasoningEffort: model?.defaultReasoningEffort ?? null,
+    serviceTier: model ? model.defaultServiceTier ?? "default" : null,
   };
 }
 

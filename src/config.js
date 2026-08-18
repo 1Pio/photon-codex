@@ -4,6 +4,14 @@ import os from "node:os";
 import path from "node:path";
 
 const KEYCHAIN_SERVICE = "photon-codex";
+const REASONING_EFFORTS = new Map([
+  ["light", "low"],
+  ["medium", "medium"],
+  ["high", "high"],
+  ["extra high", "xhigh"],
+  ["max", "max"],
+]);
+const DISPLAY_REASONING_EFFORTS = new Map(Array.from(REASONING_EFFORTS, ([display, native]) => [native, display]));
 
 export function appHome(env = process.env) {
   return path.resolve(env.PHOTON_CODEX_HOME || path.join(os.homedir(), ".config", "photon-codex"));
@@ -69,6 +77,7 @@ export async function loadConfig(env = process.env) {
     allowedSender: env.PHOTON_CODEX_ALLOWED_SENDER || stored.allowedSender,
     cwd: path.resolve(env.PHOTON_CODEX_CWD || stored.cwd || workspacePath(env)),
     maxAttachmentBytes: Number(env.PHOTON_CODEX_MAX_ATTACHMENT_BYTES || stored.maxAttachmentBytes || 50 * 1024 * 1024),
+    codexOverrides: normalizeCodexOverrides(stored.codexOverrides),
   };
   if (!config.projectId) throw new Error("Photon project ID is missing. Run `photon-codex init`.");
   config.allowedSender = normalizeSender(config.allowedSender);
@@ -79,11 +88,19 @@ export async function loadConfig(env = process.env) {
 }
 
 export async function saveConfig(config, env = process.env) {
+  const suppliedOverrides = config.codexOverrides || {};
+  const codexOverrides = normalizeCodexOverrides({
+    ...suppliedOverrides,
+    ...(DISPLAY_REASONING_EFFORTS.has(suppliedOverrides.reasoningEffort) ? {
+      reasoningEffort: DISPLAY_REASONING_EFFORTS.get(suppliedOverrides.reasoningEffort),
+    } : {}),
+  });
   const value = {
     projectId: String(config.projectId).trim(),
     allowedSender: normalizeSender(config.allowedSender),
     cwd: path.resolve(config.cwd),
     maxAttachmentBytes: Number(config.maxAttachmentBytes || 50 * 1024 * 1024),
+    ...(Object.keys(codexOverrides).length ? { codexOverrides: serializeCodexOverrides(codexOverrides) } : {}),
   };
   if (!value.projectId) throw new Error("projectId is required");
   await ensureHome(env);
@@ -203,5 +220,40 @@ export function redactConfig(config) {
     allowedSender: `${config.allowedSender.slice(0, 4)}…${config.allowedSender.slice(-3)}`,
     cwd: config.cwd,
     maxAttachmentBytes: config.maxAttachmentBytes,
+    codexOverrides: config.codexOverrides || {},
+  };
+}
+
+export function normalizeCodexOverrides(value) {
+  if (value === undefined) return {};
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new Error("codexOverrides must be an object");
+  }
+  const unknown = Object.keys(value).filter((key) => !["reasoningEffort", "fastMode"].includes(key));
+  if (unknown.length) throw new Error(`codexOverrides contains unsupported field: ${unknown.join(", ")}`);
+  const overrides = {};
+  if (Object.hasOwn(value, "reasoningEffort")) {
+    if (typeof value.reasoningEffort !== "string") {
+      throw new Error("codexOverrides.reasoningEffort must be light, medium, high, extra high, or max");
+    }
+    const normalized = REASONING_EFFORTS.get(value.reasoningEffort.trim().toLowerCase().replace(/\s+/g, " "));
+    if (!normalized) {
+      throw new Error("codexOverrides.reasoningEffort must be light, medium, high, extra high, or max");
+    }
+    overrides.reasoningEffort = normalized;
+  }
+  if (Object.hasOwn(value, "fastMode")) {
+    if (typeof value.fastMode !== "boolean") throw new Error("codexOverrides.fastMode must be true or false");
+    overrides.fastMode = value.fastMode;
+  }
+  return overrides;
+}
+
+function serializeCodexOverrides(overrides) {
+  return {
+    ...(overrides.reasoningEffort ? {
+      reasoningEffort: DISPLAY_REASONING_EFFORTS.get(overrides.reasoningEffort),
+    } : {}),
+    ...(Object.hasOwn(overrides, "fastMode") ? { fastMode: overrides.fastMode } : {}),
   };
 }

@@ -16,10 +16,17 @@ import {
   splitApprovalPrompt,
   splitMessage,
 } from "../src/bridge.js";
-import { CodexAppServer, codexEnvironment, codexExecutable } from "../src/codex.js";
+import {
+  CodexAppServer,
+  codexAppServerArgs,
+  codexEnvironment,
+  codexExecutable,
+  modelPerformanceDefaults,
+} from "../src/codex.js";
 import {
   emptyState,
   loadConfig,
+  normalizeCodexOverrides,
   normalizeSender,
   normalizeState,
   saveConfig,
@@ -33,7 +40,7 @@ test("normalizes E.164 input without weakening validation", () => {
   assert.throws(() => normalizeSender("555-1234"));
 });
 
-test("persists only Photon transport configuration", async () => {
+test("persists only transport configuration and the two explicit Codex overrides", async () => {
   const home = await mkdtemp(path.join(os.tmpdir(), "photon-codex-config-"));
   const env = {
     PHOTON_CODEX_HOME: home,
@@ -45,15 +52,17 @@ test("persists only Photon transport configuration", async () => {
       projectId: "project",
       allowedSender: "+15551234567",
       cwd: path.join(home, "workspace"),
-      reasoningEffort: "extra high",
-      fastMode: false,
+      codexOverrides: {
+        reasoningEffort: "extra high",
+        fastMode: false,
+      },
     }, env);
 
     const stored = JSON.parse(await readFile(path.join(home, "config.json"), "utf8"));
     const loaded = await loadConfig(env);
-    assert.deepEqual(Object.keys(stored).sort(), ["allowedSender", "cwd", "maxAttachmentBytes", "projectId"]);
-    assert.equal("reasoningEffort" in loaded, false);
-    assert.equal("fastMode" in loaded, false);
+    assert.deepEqual(Object.keys(stored).sort(), ["allowedSender", "codexOverrides", "cwd", "maxAttachmentBytes", "projectId"]);
+    assert.deepEqual(stored.codexOverrides, { reasoningEffort: "extra high", fastMode: false });
+    assert.deepEqual(loaded.codexOverrides, { reasoningEffort: "xhigh", fastMode: false });
   } finally {
     await rm(home, { recursive: true, force: true });
   }
@@ -72,10 +81,67 @@ test("ignores legacy Codex overrides in Photon config", async () => {
     }));
 
     const loaded = await loadConfig(env);
-    assert.deepEqual(Object.keys(loaded).sort(), ["allowedSender", "cwd", "maxAttachmentBytes", "projectId"]);
+    assert.deepEqual(Object.keys(loaded).sort(), ["allowedSender", "codexOverrides", "cwd", "maxAttachmentBytes", "projectId"]);
+    assert.deepEqual(loaded.codexOverrides, {});
   } finally {
     await rm(home, { recursive: true, force: true });
   }
+});
+
+test("normalizes the complete public reasoning vocabulary and validates the override boundary", () => {
+  assert.deepEqual(normalizeCodexOverrides(), {});
+  assert.deepEqual(normalizeCodexOverrides({ reasoningEffort: "light" }), { reasoningEffort: "low" });
+  assert.deepEqual(normalizeCodexOverrides({ reasoningEffort: "medium" }), { reasoningEffort: "medium" });
+  assert.deepEqual(normalizeCodexOverrides({ reasoningEffort: "high" }), { reasoningEffort: "high" });
+  assert.deepEqual(normalizeCodexOverrides({ reasoningEffort: " Extra   High " }), { reasoningEffort: "xhigh" });
+  assert.deepEqual(normalizeCodexOverrides({ reasoningEffort: "max", fastMode: true }), {
+    reasoningEffort: "max",
+    fastMode: true,
+  });
+  assert.deepEqual(normalizeCodexOverrides({ fastMode: false }), { fastMode: false });
+  assert.throws(() => normalizeCodexOverrides({ reasoningEffort: "minimal" }), /light, medium, high, extra high, or max/);
+  assert.throws(() => normalizeCodexOverrides({ fastMode: "false" }), /must be true or false/);
+  assert.throws(() => normalizeCodexOverrides({ model: "gpt-5.6-sol" }), /unsupported field: model/);
+  assert.throws(() => normalizeCodexOverrides([]), /must be an object/);
+});
+
+test("uses only app-server process overrides for performance settings", () => {
+  assert.deepEqual(codexAppServerArgs(), ["app-server", "--listen", "stdio://"]);
+  assert.deepEqual(codexAppServerArgs({ reasoningEffort: "xhigh" }), [
+    "app-server", "--listen", "stdio://", "--config", "model_reasoning_effort=\"xhigh\"",
+  ]);
+  assert.deepEqual(codexAppServerArgs({ fastMode: false }), [
+    "app-server", "--listen", "stdio://", "--config", "service_tier=\"default\"",
+  ]);
+  assert.deepEqual(codexAppServerArgs({ reasoningEffort: "max", fastMode: true }), [
+    "app-server", "--listen", "stdio://",
+    "--config", "model_reasoning_effort=\"max\"",
+    "--config", "service_tier=\"fast\"",
+  ]);
+  assert.throws(() => codexAppServerArgs({ reasoningEffort: "extra high" }), /Invalid native/);
+  assert.throws(() => codexAppServerArgs({ fastMode: 1 }), /Invalid Codex fast mode/);
+});
+
+test("never borrows performance defaults from an unrelated catalog model", () => {
+  const models = [{
+    id: "gpt-default",
+    model: "gpt-default",
+    isDefault: true,
+    defaultReasoningEffort: "low",
+    defaultServiceTier: null,
+  }];
+  assert.deepEqual(modelPerformanceDefaults({ model: null }, models), {
+    reasoningEffort: "low",
+    serviceTier: "default",
+  });
+  assert.deepEqual(modelPerformanceDefaults({ model: "gpt-default" }, models), {
+    reasoningEffort: "low",
+    serviceTier: "default",
+  });
+  assert.deepEqual(modelPerformanceDefaults({ model: "custom-provider-model" }, models), {
+    reasoningEffort: null,
+    serviceTier: null,
+  });
 });
 
 test("sanitizes inbound filenames", () => {
@@ -751,7 +817,7 @@ test("starts each turn on the loaded thread without resuming again", async () =>
   assert.deepEqual(saved, ["thread-1"]);
 });
 
-test("starts a thread with only cwd and injects transport instructions separately", async () => {
+test("starts a thread with only cwd and app-server-resolved performance values", async () => {
   const codex = configuredCodex({ transportInstructions: "transport only" });
   const requests = [];
   codex.request = async (method, params) => {
@@ -763,11 +829,95 @@ test("starts a thread with only cwd and injects transport instructions separatel
   await codex.newThread();
 
   assert.deepEqual(requests.map(({ method }) => method), ["thread/start", "thread/inject_items"]);
-  assert.deepEqual(requests[0].params, { cwd: "/tmp" });
+  assert.deepEqual(requests[0].params, {
+    cwd: "/tmp",
+    serviceTier: "priority",
+    config: { model_reasoning_effort: "xhigh" },
+  });
   assert.equal(requests[1].params.items[0].role, "developer");
   assert.equal(requests[1].params.items[0].content[0].text, "transport only");
   assert.equal(codex.parityReport().verified, true);
   assert.deepEqual(codex.parityReport().overrides, []);
+});
+
+test("fresh threads materialize native model defaults for strict verification", async () => {
+  const codex = configuredCodex();
+  codex.effectiveConfig.model_reasoning_effort = null;
+  codex.effectiveConfig.service_tier = null;
+  codex.modelPerformanceDefaults = { reasoningEffort: "low", serviceTier: "default" };
+  let params;
+  codex.request = async (method, requestParams) => {
+    params = requestParams;
+    return {
+      ...inheritedThread("thread-defaults"),
+      reasoningEffort: "low",
+      serviceTier: "default",
+    };
+  };
+
+  await codex.newThread();
+
+  assert.deepEqual(params, {
+    cwd: "/tmp",
+    serviceTier: "default",
+    config: { model_reasoning_effort: "low" },
+  });
+  assert.equal(codex.parityReport().performance.reasoningEffort.source, "native");
+  assert.equal(codex.parityReport().effectiveVerified, true);
+});
+
+test("reports partial and combined overrides as verified effective values", async () => {
+  const partial = configuredCodex({ codexOverrides: { reasoningEffort: "xhigh" } });
+  partial.request = async (method) => method === "thread/start" ? inheritedThread("thread-partial") : {};
+  await partial.newThread();
+
+  const partialParity = partial.parityReport();
+  assert.equal(partialParity.inherited, true);
+  assert.equal(partialParity.effectiveVerified, true);
+  assert.deepEqual(partialParity.overrides, ["reasoningEffort"]);
+  assert.deepEqual(partialParity.performance.reasoningEffort, {
+    source: "override",
+    configured: "extra high",
+    effective: "xhigh",
+    thread: "xhigh",
+    verified: true,
+  });
+  assert.equal(partialParity.performance.fastMode.source, "native");
+
+  const combined = configuredCodex({ codexOverrides: { reasoningEffort: "xhigh", fastMode: true } });
+  combined.request = async (method) => method === "thread/start" ? inheritedThread("thread-combined") : {};
+  await combined.newThread();
+  const combinedParity = combined.parityReport();
+  assert.deepEqual(combinedParity.overrides, ["reasoningEffort", "fastMode"]);
+  assert.deepEqual(combinedParity.performance.fastMode, {
+    source: "override",
+    configured: true,
+    effective: true,
+    serviceTier: "priority",
+    threadServiceTier: "priority",
+    verified: true,
+  });
+  assert.equal(combinedParity.effectiveVerified, true);
+});
+
+test("fastMode false explicitly verifies the default service tier", async () => {
+  const codex = configuredCodex({ codexOverrides: { fastMode: false } });
+  codex.effectiveConfig.service_tier = "default";
+  codex.request = async (method) => method === "thread/start"
+    ? { ...inheritedThread("thread-default"), serviceTier: "default" }
+    : {};
+
+  await codex.newThread();
+
+  assert.deepEqual(codex.parityReport().performance.fastMode, {
+    source: "override",
+    configured: false,
+    effective: false,
+    serviceTier: "default",
+    threadServiceTier: "default",
+    verified: true,
+  });
+  assert.equal(codex.parityReport().effectiveVerified, true);
 });
 
 test("persists a new Codex thread immediately so restart cannot rotate it", async () => {
@@ -810,7 +960,7 @@ test("fails closed when a persisted Codex thread cannot resume", async () => {
   assert.deepEqual(methods, ["thread/resume"]);
 });
 
-test("resumes persisted threads without Codex setting overrides", async () => {
+test("resumes persisted threads with app-server-resolved native performance values", async () => {
   const codex = configuredCodex({ threadId: "thread-1" });
   let request;
   codex.request = async (method, params) => {
@@ -821,25 +971,120 @@ test("resumes persisted threads without Codex setting overrides", async () => {
   await codex.ensureThread();
 
   assert.equal(request.method, "thread/resume");
-  assert.deepEqual(request.params, { threadId: "thread-1", cwd: "/tmp" });
+  assert.deepEqual(request.params, {
+    threadId: "thread-1",
+    cwd: "/tmp",
+    serviceTier: "priority",
+    config: { model_reasoning_effort: "xhigh" },
+  });
   assert.equal(codex.parityReport().verified, true);
 });
 
-test("does not replace a resumed thread when optional settings are unreported", async () => {
+test("omitted reasoning override resumes with the current native model default, not stale metadata", async () => {
   const codex = configuredCodex({ threadId: "thread-1" });
-  const methods = [];
-  codex.request = async (method) => {
-    methods.push(method);
-    return { ...inheritedThread("thread-1"), reasoningEffort: null };
+  codex.effectiveConfig.model_reasoning_effort = null;
+  codex.modelPerformanceDefaults = { reasoningEffort: "medium", serviceTier: "priority" };
+  let request;
+  codex.request = async (method, params) => {
+    request = { method, params };
+    return { ...inheritedThread("thread-1"), reasoningEffort: "medium" };
   };
 
   await codex.ensureThread();
 
-  assert.deepEqual(methods, ["thread/resume"]);
   assert.equal(codex.threadId, "thread-1");
+  assert.deepEqual(request.params.config, { model_reasoning_effort: "medium" });
+  assert.equal(codex.parityReport().performance.reasoningEffort.source, "native");
+  assert.equal(codex.parityReport().performance.reasoningEffort.effective, "medium");
+  assert.equal(codex.parityReport().performance.reasoningEffort.verified, true);
+  assert.equal(codex.parityReport().effectiveVerified, true);
+});
+
+test("restart resumes the same overridden thread and later turns inherit the process overlay", async () => {
+  const saved = [];
+  const codex = configuredCodex({
+    threadId: "thread-1",
+    codexOverrides: { reasoningEffort: "xhigh", fastMode: true },
+    onThreadId: async (id) => saved.push(id),
+  });
+  const requests = [];
+  codex.request = async (method, params) => {
+    requests.push({ method, params });
+    if (method === "thread/resume") return inheritedThread("thread-1");
+    return { turn: { id: "turn-1" } };
+  };
+
+  await codex.ensureThread();
+  await codex.startTurn([{ type: "text", text: "next" }]);
+
+  assert.equal(codex.threadId, "thread-1");
+  assert.deepEqual(requests.map(({ method }) => method), ["thread/resume", "turn/start"]);
+  assert.deepEqual(requests[0].params, {
+    threadId: "thread-1",
+    cwd: "/tmp",
+    serviceTier: "priority",
+    config: { model_reasoning_effort: "xhigh" },
+  });
+  assert.deepEqual(Object.keys(requests[1].params).sort(), ["input", "threadId"]);
+  assert.deepEqual(saved, ["thread-1", "thread-1"]);
+  assert.equal(codex.parityReport().effectiveVerified, true);
+});
+
+test("changed performance overrides replace an incompatible resumed thread", async () => {
+  const codex = configuredCodex({
+    threadId: "thread-old",
+    codexOverrides: { reasoningEffort: "xhigh", fastMode: true },
+  });
+  const methods = [];
+  codex.request = async (method) => {
+    methods.push(method);
+    if (method === "thread/resume") {
+      return { ...inheritedThread("thread-old"), reasoningEffort: "medium", serviceTier: "default" };
+    }
+    return inheritedThread("thread-overridden");
+  };
+
+  await codex.ensureThread();
+
+  assert.deepEqual(methods, ["thread/resume", "thread/start"]);
+  assert.equal(codex.threadId, "thread-overridden");
+  assert.equal(codex.parityReport().effectiveVerified, true);
+});
+
+test("steering never carries or mutates performance overrides", async () => {
+  const codex = configuredCodex({
+    threadId: "thread-1",
+    codexOverrides: { reasoningEffort: "max", fastMode: false },
+  });
+  let request;
+  codex.request = async (method, params) => {
+    request = { method, params };
+    return { turnId: "turn-active" };
+  };
+
+  await codex.steer("turn-active", [{ type: "text", text: "more" }]);
+
+  assert.equal(request.method, "turn/steer");
+  assert.deepEqual(Object.keys(request.params).sort(), ["expectedTurnId", "input", "threadId"]);
+});
+
+test("replaces a resumed thread when an effective performance value is unreported", async () => {
+  const codex = configuredCodex({ threadId: "thread-1" });
+  const methods = [];
+  codex.request = async (method) => {
+    methods.push(method);
+    return method === "thread/resume"
+      ? { ...inheritedThread("thread-1"), reasoningEffort: null }
+      : inheritedThread("thread-new");
+  };
+
+  await codex.ensureThread();
+
+  assert.deepEqual(methods, ["thread/resume", "thread/start"]);
+  assert.equal(codex.threadId, "thread-new");
   assert.equal(codex.parityReport().inherited, true);
-  assert.equal(codex.parityReport().verified, false);
-  assert.deepEqual(codex.parityReport().unreported, ["reasoningEffort"]);
+  assert.equal(codex.parityReport().effectiveVerified, true);
+  assert.deepEqual(codex.parityReport().unreported, []);
 });
 
 test("replaces a persisted thread whose settings do not match native config", async () => {

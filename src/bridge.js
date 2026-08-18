@@ -73,6 +73,7 @@ export class Bridge {
       threadId: this.state.threadId,
       env: this.env,
       transportInstructions: TRANSPORT_INSTRUCTIONS,
+      codexOverrides: this.config.codexOverrides,
       onThreadId: async (threadId) => {
         await this.#updateState((state) => { state.threadId = threadId; });
       },

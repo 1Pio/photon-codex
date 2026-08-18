@@ -144,12 +144,13 @@ async function doctorResult() {
       const probe = new CodexAppServer({
         cwd: config.cwd,
         ephemeral: true,
+        codexOverrides: config.codexOverrides,
         onThreadId: async () => {},
       });
       try {
         await probe.start();
         const parity = probe.parityReport();
-        checks.push({ check: "codex-config-parity", ok: parity.inherited, value: parity });
+        checks.push({ check: "codex-config-parity", ok: parity.effectiveVerified, value: parity });
         checks.push({ check: "codex-auth", ok: probe.account.authenticated, value: probe.account });
         const capabilities = await capabilityInventory(probe, config.cwd);
         checks.push({ check: "codex-capabilities", ok: capabilities.ok, value: capabilities });
