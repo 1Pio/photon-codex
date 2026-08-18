@@ -1,17 +1,83 @@
 import assert from "node:assert/strict";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
-import { Bridge, normalizePhone, safeName, splitMessage } from "../src/bridge.js";
+import { Bridge, normalizePhone, parseOutboundResponse, safeName, splitMessage } from "../src/bridge.js";
 import { CodexAppServer, FAST_SERVICE_TIER } from "../src/codex.js";
-import { emptyState, normalizeSender, normalizeState } from "../src/config.js";
+import {
+  codexReasoningEffort,
+  emptyState,
+  loadConfig,
+  normalizeFastMode,
+  normalizeReasoningEffort,
+  normalizeSender,
+  normalizeState,
+  saveConfig,
+} from "../src/config.js";
 import { launchAgentPlist } from "../src/service.js";
 
 test("normalizes E.164 input without weakening validation", () => {
   assert.equal(normalizeSender("+1 (555) 123-4567"), "+15551234567");
   assert.equal(normalizePhone("+971 58 123 4567"), "+971581234567");
   assert.throws(() => normalizeSender("555-1234"));
+});
+
+test("normalizes friendly reasoning effort labels to Codex values", () => {
+  assert.equal(normalizeReasoningEffort("light"), "light");
+  assert.equal(normalizeReasoningEffort(" Extra High "), "extra high");
+  assert.equal(normalizeReasoningEffort("xhigh"), "extra high");
+  assert.equal(codexReasoningEffort("light"), "low");
+  assert.equal(codexReasoningEffort("extra high"), "xhigh");
+  assert.equal(codexReasoningEffort("max"), "max");
+  assert.throws(() => normalizeReasoningEffort("ultra"), /light, medium, high, extra high, max/);
+});
+
+test("requires fastMode to be a JSON boolean", () => {
+  assert.equal(normalizeFastMode(true), true);
+  assert.equal(normalizeFastMode(false), false);
+  assert.throws(() => normalizeFastMode("false"), /boolean/);
+});
+
+test("persists and loads reasoning effort and disabled fast mode", async () => {
+  const home = await mkdtemp(path.join(os.tmpdir(), "photon-codex-config-"));
+  const env = { PHOTON_CODEX_HOME: home };
+  try {
+    await saveConfig({
+      projectId: "project",
+      allowedSender: "+15551234567",
+      cwd: path.join(home, "workspace"),
+      reasoningEffort: "extra high",
+      fastMode: false,
+    }, env);
+
+    const stored = JSON.parse(await readFile(path.join(home, "config.json"), "utf8"));
+    const loaded = await loadConfig(env);
+    assert.equal(stored.reasoningEffort, "extra high");
+    assert.equal(stored.fastMode, false);
+    assert.equal(loaded.reasoningEffort, "extra high");
+    assert.equal(loaded.fastMode, false);
+  } finally {
+    await rm(home, { recursive: true, force: true });
+  }
+});
+
+test("defaults legacy configs to medium reasoning with fast mode enabled", async () => {
+  const home = await mkdtemp(path.join(os.tmpdir(), "photon-codex-legacy-config-"));
+  const env = { PHOTON_CODEX_HOME: home };
+  try {
+    await writeFile(path.join(home, "config.json"), JSON.stringify({
+      projectId: "project",
+      allowedSender: "+15551234567",
+      cwd: path.join(home, "workspace"),
+    }));
+
+    const loaded = await loadConfig(env);
+    assert.equal(loaded.reasoningEffort, "medium");
+    assert.equal(loaded.fastMode, true);
+  } finally {
+    await rm(home, { recursive: true, force: true });
+  }
 });
 
 test("sanitizes inbound filenames", () => {
@@ -23,6 +89,15 @@ test("splits long replies without losing text", () => {
   const source = `${"a".repeat(30)}\n\n${"b".repeat(30)}`;
   const chunks = splitMessage(source, 40);
   assert.deepEqual(chunks, ["a".repeat(30), "b".repeat(30)]);
+});
+
+test("extracts a private Photon reaction directive from a response", () => {
+  assert.deepEqual(parseOutboundResponse("[[photon_reaction:🦦]]"), { reaction: "🦦", text: "" });
+  assert.deepEqual(parseOutboundResponse("[[photon_reaction:🫡]]\nWorking on it."), {
+    reaction: "🫡",
+    text: "Working on it.",
+  });
+  assert.deepEqual(parseOutboundResponse("Normal reply"), { reaction: null, text: "Normal reply" });
 });
 
 test("ignores Photon read receipts before starting a Codex turn", async () => {
@@ -77,6 +152,7 @@ test("accepts one user message and records one successful reply", async () => {
   try {
     const inputs = [];
     const replies = [];
+    const reactions = [];
     const bridge = new Bridge({
       config: {
         projectId: "project",
@@ -109,12 +185,13 @@ test("accepts one user message and records one successful reply", async () => {
       timestamp: new Date("2026-08-19T00:00:00.000Z"),
       content: { type: "text", text: "hello" },
       read: async () => {},
+      react: async (emoji) => { reactions.push(emoji); },
       reply: async (content) => { replies.push(content); },
       space,
     };
 
     await bridge.handleMessage(space, message);
-    bridge.finalByTurn.set("turn-1", "hello back");
+    bridge.finalByTurn.set("turn-1", "[[photon_reaction:🫡]]\nhello back");
     await bridge.handleCodexNotification("turn/completed", {
       turn: { id: "turn-1", status: "completed", items: [] },
     });
@@ -122,6 +199,7 @@ test("accepts one user message and records one successful reply", async () => {
     assert.equal(inputs.length, 1);
     assert.match(inputs[0][0].text, /hello$/);
     assert.equal(replies.length, 1);
+    assert.deepEqual(reactions, ["🫡"]);
     assert.deepEqual(bridge.state.acceptedMessageIds, ["message-1"]);
     assert.deepEqual(bridge.state.repliedMessageIds, ["message-1"]);
     assert.equal(bridge.state.runtime.acceptedMessages, 1);
@@ -129,6 +207,34 @@ test("accepts one user message and records one successful reply", async () => {
   } finally {
     await rm(home, { recursive: true, force: true });
   }
+});
+
+test("status distinguishes configured, next-turn, and current effective effort", () => {
+  const bridge = new Bridge({
+    config: {
+      projectId: "project",
+      allowedSender: "+15551234567",
+      cwd: "/tmp",
+      maxAttachmentBytes: 1024,
+      reasoningEffort: "extra high",
+      fastMode: true,
+    },
+    projectSecret: "secret",
+  });
+  bridge.state = emptyState();
+  bridge.codex = {
+    threadId: "thread-1",
+    reasoningEffort: "xhigh",
+    effectiveReasoningEffort: "medium",
+    serviceTier: "priority",
+  };
+
+  const status = bridge.status();
+  assert.equal(status.reasoningEffort, "extra high");
+  assert.equal(status.nextTurnReasoningEffort, "xhigh");
+  assert.equal(status.effectiveReasoningEffort, "medium");
+  assert.equal(status.fastMode, true);
+  assert.equal(status.priority, true);
 });
 
 test("migrates legacy state without retaining receipt events as messages", () => {
@@ -228,4 +334,48 @@ test("requests fast service and records app-server priority mode", async () => {
   assert.equal(request.method, "thread/start");
   assert.equal(request.params.serviceTier, FAST_SERVICE_TIER);
   assert.equal(codex.serviceTier, "priority");
+});
+
+test("applies configured effort and explicitly clears fast service when disabled", async () => {
+  const codex = new CodexAppServer({
+    cwd: "/tmp",
+    reasoningEffort: "xhigh",
+    fastMode: false,
+    onThreadId: async () => {},
+  });
+  const requests = [];
+  codex.request = async (method, params) => {
+    requests.push({ method, params });
+    if (method === "thread/start") return { thread: { id: "thread-standard" } };
+    return { turn: { id: "turn-standard" } };
+  };
+
+  await codex.newThread();
+  await codex.startTurn([{ type: "text", text: "hello" }]);
+
+  assert.deepEqual(requests.map(({ method }) => method), ["thread/start", "turn/start"]);
+  assert.equal(requests[0].params.serviceTier, null);
+  assert.equal(requests[1].params.serviceTier, null);
+  assert.equal(requests[1].params.effort, "xhigh");
+  assert.equal(codex.effectiveReasoningEffort, "xhigh");
+});
+
+test("clears inherited fast service when resuming with fast mode disabled", async () => {
+  const codex = new CodexAppServer({
+    cwd: "/tmp",
+    threadId: "thread-standard",
+    fastMode: false,
+    onThreadId: async () => {},
+  });
+  let request;
+  codex.request = async (method, params) => {
+    request = { method, params };
+    return { thread: { id: "thread-standard" }, serviceTier: null };
+  };
+
+  await codex.ensureThread();
+
+  assert.equal(request.method, "thread/resume");
+  assert.equal(request.params.serviceTier, null);
+  assert.equal(codex.serviceTier, null);
 });

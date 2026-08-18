@@ -37,6 +37,7 @@ try {
   else if (command === "status") print({ ...(await control("status")), service: serviceStatus() });
   else if (command === "stop") print(await control("stop"));
   else if (command === "send") print(await control("send", { text: args.join(" ") }));
+  else if (command === "send-file") await sendFile(args);
   else if (command === "reply") print(await control("reply", { messageId: args[0], text: args.slice(1).join(" ") }));
   else if (command === "react") print(await control("react", { messageId: args[0], emoji: args[1] }));
   else if (command === "thread" && args[0] === "new") print(await control("thread-new"));
@@ -145,6 +146,12 @@ async function workspaceSet(args) {
   print({ configured: true, restartRequired: true, config: redactConfig(saved) });
 }
 
+async function sendFile(args) {
+  const file = path.resolve(requiredText(args[0]));
+  const mimeType = args[1] || "application/octet-stream";
+  print(await control("send-file", { file, mimeType, name: path.basename(file) }));
+}
+
 async function serviceInstall() {
   const result = await doctorResult();
   if (!result.ok) throw new Error(`preflight failed: ${result.checks.filter((check) => !check.ok).map((check) => check.check).join(", ")}`);
@@ -251,6 +258,7 @@ function help(exitCode) {
   status
   stop
   send TEXT
+  send-file PATH [MIME_TYPE]
   reply MESSAGE_ID TEXT
   react MESSAGE_ID EMOJI
   thread new

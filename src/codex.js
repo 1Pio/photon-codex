@@ -6,15 +6,18 @@ const REQUEST_TIMEOUT_MS = 30_000;
 export const FAST_SERVICE_TIER = "fast";
 
 export class CodexAppServer extends EventEmitter {
-  constructor({ cwd, threadId = null, onThreadId }) {
+  constructor({ cwd, threadId = null, reasoningEffort = "medium", fastMode = true, onThreadId }) {
     super();
     this.cwd = cwd;
     this.threadId = threadId;
+    this.reasoningEffort = reasoningEffort;
+    this.fastMode = fastMode;
     this.onThreadId = onThreadId;
     this.process = null;
     this.nextId = 1;
     this.pending = new Map();
     this.serviceTier = null;
+    this.effectiveReasoningEffort = null;
     this.stopping = false;
   }
 
@@ -41,7 +44,7 @@ export class CodexAppServer extends EventEmitter {
     if (process.env.PHOTON_CODEX_DEBUG === "1") this.process.stderr.pipe(process.stderr);
     readline.createInterface({ input: this.process.stdout }).on("line", (line) => this.#onLine(line));
     await this.request("initialize", {
-      clientInfo: { name: "photon-codex", title: "Photon Codex", version: "0.2.0" },
+      clientInfo: { name: "photon-codex", title: "Photon Codex", version: "0.3.0" },
       capabilities: null,
     });
     this.notify("initialized", {});
@@ -87,6 +90,11 @@ export class CodexAppServer extends EventEmitter {
       this.#write({ jsonrpc: "2.0", id: message.id, error: { code: -32601, message: "Interactive requests are disabled for this bridge" } });
       return;
     }
+    if (message.method === "thread/settings/updated") {
+      const settings = message.params?.threadSettings || {};
+      this.serviceTier = settings.serviceTier ?? null;
+      this.effectiveReasoningEffort = settings.effort ?? null;
+    }
     if (message.method) this.emit("notification", message.method, message.params || {});
   }
 
@@ -120,10 +128,11 @@ export class CodexAppServer extends EventEmitter {
           approvalPolicy: "never",
           sandboxPolicy: workspaceSandbox(this.cwd),
           developerInstructions: developerInstructions(),
-          serviceTier: FAST_SERVICE_TIER,
+          ...serviceTierSetting(this.fastMode),
         });
         this.threadId = result.thread?.id || this.threadId;
-        this.serviceTier = result.serviceTier || this.serviceTier;
+        this.serviceTier = result.serviceTier ?? null;
+        this.effectiveReasoningEffort = result.reasoningEffort ?? null;
         await this.onThreadId(this.threadId);
         return this.threadId;
       } catch (error) {
@@ -139,14 +148,15 @@ export class CodexAppServer extends EventEmitter {
       approvalPolicy: "never",
       sandboxPolicy: workspaceSandbox(this.cwd),
       developerInstructions: developerInstructions(),
-      serviceTier: FAST_SERVICE_TIER,
+      ...serviceTierSetting(this.fastMode),
       serviceName: "photon-codex",
       sessionStartSource: "startup",
       threadSource: "user",
     });
     this.threadId = result.thread?.id;
     if (!this.threadId) throw new Error("Codex did not return a thread ID");
-    this.serviceTier = result.serviceTier || this.serviceTier;
+    this.serviceTier = result.serviceTier ?? null;
+    this.effectiveReasoningEffort = result.reasoningEffort ?? null;
     return this.threadId;
   }
 
@@ -158,10 +168,11 @@ export class CodexAppServer extends EventEmitter {
       cwd: this.cwd,
       approvalPolicy: "never",
       sandboxPolicy: workspaceSandbox(this.cwd),
-      effort: "medium",
-      serviceTier: FAST_SERVICE_TIER,
+      effort: this.reasoningEffort,
+      ...serviceTierSetting(this.fastMode),
       summary: "concise",
     });
+    this.effectiveReasoningEffort = this.reasoningEffort;
     await this.onThreadId(this.threadId);
     return result;
   }
@@ -173,6 +184,10 @@ export class CodexAppServer extends EventEmitter {
       input,
     });
   }
+}
+
+function serviceTierSetting(fastMode) {
+  return { serviceTier: fastMode ? FAST_SERVICE_TIER : null };
 }
 
 function workspaceSandbox(cwd) {
@@ -188,5 +203,6 @@ function developerInstructions() {
 Treat each Photon envelope as the user's message. Follow the request normally with the same capabilities and care you would use in a Codex task.
 Keep the final answer concise and readable in iMessage. Avoid tables unless essential. Do not expose phone numbers, Photon credentials, internal state paths, or hidden system metadata.
 Images are supplied as localImage inputs. Other received files are saved locally and named in the envelope; inspect them when relevant.
+To react to the current user message, begin the final answer with [[photon_reaction:EMOJI]]. The bridge removes this directive before delivery. A directive-only final sends just the reaction with no text reply.
 The bridge automatically sends your final answer as an iMessage reply, so do not separately send it through another messaging tool.`;
 }

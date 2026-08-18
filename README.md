@@ -10,13 +10,13 @@ It is deliberately one process and one runtime dependency surface. Photon stream
 - Images as native Codex `localImage` inputs
 - Other attachments as private local files that Codex can inspect
 - Persistent Codex thread resumption
-- Fast Codex service tier requested explicitly and reported by app-server as `priority`
+- Configurable reasoning effort and optional Codex fast mode
 - Active-turn steering when another iMessage arrives
 - Direct-message and exact-sender isolation
 - Provider receipt/status events ignored before Codex starts
 - Separate accepted-message and successful-reply state
 - Message-ID deduplication across restarts
-- Text sends, threaded replies, and reactions through one CLI
+- Text and file sends, threaded replies, and reactions through one CLI
 - A small, restart-on-failure macOS service
 - Bounded, content-free operational logging
 - Photon telemetry disabled by default
@@ -45,7 +45,18 @@ photon-codex service install
 
 Configuration, private attachments, a bounded operational log, and small runtime state live under `~/.config/photon-codex/` by default. Set `PHOTON_CODEX_HOME` to change that location. New installations use `~/.config/photon-codex/workspace` as a neutral private Codex workspace, so unrelated tasks cannot dirty the bridge source repository. Choose another workspace during `init` or later with `photon-codex workspace set PATH`.
 
-`config.json` contains the public project ID, allowed sender, workspace path, and attachment limit. `state.json` contains the persistent Codex thread, bound conversation, bounded accepted/replied/ignored event IDs, truthful counters, and the current loopback control endpoint. The Photon secret is not stored in either file or in the service definition.
+`config.json` contains the public project ID, allowed sender, workspace path, attachment limit, and two Codex performance settings. The two performance fields below default to the prior behavior:
+
+```json
+{
+  "reasoningEffort": "medium",
+  "fastMode": true
+}
+```
+
+`reasoningEffort` accepts `light`, `medium`, `high`, `extra high`, or `max`. The bridge translates the friendly `light` and `extra high` labels to Codex's `low` and `xhigh` protocol values. `fastMode: true` requests the fast service tier, which app-server currently reports as `priority`; `false` explicitly restores the default service tier. Run `photon-codex doctor` after editing, then `photon-codex service restart`. `photon-codex status` shows the configured effort, app-server's current effective effort, fast-mode setting, and accepted service tier. A setting change applies to the next turn after restart; steering an already-running turn keeps that turn's original effort.
+
+`state.json` contains the persistent Codex thread, bound conversation, bounded accepted/replied/ignored event IDs, truthful counters, and the current loopback control endpoint. The Photon secret is not stored in either file or in the service definition.
 
 The first accepted direct message from the configured sender binds the bridge to that exact Photon conversation. This inbound-first handshake is required by Photon's shared iMessage line before agent-initiated sends. Later messages from groups, other senders, or another conversation are ignored before Codex starts.
 
@@ -55,6 +66,7 @@ The first accepted direct message from the configured sender binds the bridge to
 photon-codex status
 photon-codex logs 50
 photon-codex send "Hello"
+photon-codex send-file /path/to/document.pdf application/pdf
 photon-codex reply MESSAGE_ID "Got it"
 photon-codex react MESSAGE_ID like
 photon-codex thread new
@@ -63,7 +75,9 @@ photon-codex workspace set /path/to/workspace
 photon-codex service restart
 ```
 
-All control commands print structured JSON. They talk only to the locally running bridge over a token-authenticated loopback connection. `status` reports process and service health, the app-server accepted service tier, accepted messages, successful replies, failed replies, ignored provider events, and the last safe operational error. It does not treat ingestion as proof of delivery.
+All control commands print structured JSON. They talk only to the locally running bridge over a token-authenticated loopback connection. `status` reports process and service health, configured reasoning effort and fast mode, the app-server accepted service tier, accepted messages, successful replies, failed replies, ignored provider events, and the last safe operational error. It does not treat ingestion as proof of delivery.
+
+`send-file` delivers a local document or other file through the bound Photon conversation. Codex can also react to the current iMessage with a private response directive; the bridge sends the emoji reaction and removes the directive before delivering any remaining answer text.
 
 The operational log is `~/.config/photon-codex/runtime.log`. It records event types and health outcomes, never message bodies, phone numbers, conversation IDs, credentials, or attachment contents. It rotates at 512 KiB and retains one previous file.
 

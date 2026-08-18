@@ -1,10 +1,10 @@
 import { randomBytes } from "node:crypto";
-import { mkdir, writeFile } from "node:fs/promises";
+import { mkdir, stat, writeFile } from "node:fs/promises";
 import net from "node:net";
 import path from "node:path";
-import { Spectrum, markdown } from "@spectrum-ts/core";
+import { Spectrum, attachment, markdown } from "@spectrum-ts/core";
 import { imessage } from "@spectrum-ts/imessage";
-import { attachmentsPath, loadState, saveState } from "./config.js";
+import { attachmentsPath, codexReasoningEffort, loadState, saveState } from "./config.js";
 import { CodexAppServer } from "./codex.js";
 import { logEvent } from "./log.js";
 
@@ -58,6 +58,8 @@ export class Bridge {
     this.codex = new CodexAppServer({
       cwd: this.config.cwd,
       threadId: this.state.threadId,
+      reasoningEffort: codexReasoningEffort(this.config.reasoningEffort),
+      fastMode: this.config.fastMode,
       onThreadId: async (threadId) => {
         await this.#updateState((state) => { state.threadId = threadId; });
       },
@@ -76,6 +78,10 @@ export class Bridge {
     await this.codex.start();
     await this.#startControlServer();
     await this.logger("info", "bridge_ready", {
+      reasoningEffort: this.config.reasoningEffort,
+      nextTurnReasoningEffort: this.codex.reasoningEffort,
+      effectiveReasoningEffort: this.codex.effectiveReasoningEffort,
+      fastMode: this.config.fastMode,
       serviceTier: this.codex.serviceTier,
       threadBound: Boolean(this.codex.threadId),
     }, this.env);
@@ -215,7 +221,9 @@ export class Bridge {
     await this.space?.stopTyping().catch(() => {});
     if (!target) return;
     if (params.turn?.status === "completed" && final) {
-      const chunks = splitMessage(stripInternal(final));
+      const outbound = parseOutboundResponse(stripInternal(final));
+      if (outbound.reaction) await retryTransient(() => target.react(outbound.reaction));
+      const chunks = splitMessage(outbound.text);
       if (chunks.length) await retryTransient(() => target.reply(markdown(chunks[0])));
       for (const chunk of chunks.slice(1)) await retryTransient(() => target.space.send(markdown(chunk)));
       await this.#recordReply(target.id);
@@ -271,6 +279,18 @@ export class Bridge {
       const sent = await space.send(markdown(requiredText(request.text)));
       return { messageId: sent?.id || null };
     }
+    if (request.command === "send-file") {
+      const file = path.resolve(requiredText(request.file));
+      const fileStat = await stat(file);
+      if (!fileStat.isFile()) throw new Error("attachment path is not a regular file");
+      if (fileStat.size > this.config.maxAttachmentBytes) {
+        throw new Error(`attachment exceeds ${this.config.maxAttachmentBytes} bytes`);
+      }
+      const name = safeName(request.name || path.basename(file));
+      const mimeType = requiredText(request.mimeType || "application/octet-stream");
+      const sent = await space.send(attachment(file, { name, mimeType }));
+      return { messageId: sent?.id || null, name, size: fileStat.size };
+    }
     const message = await space.getMessage(requiredText(request.messageId));
     if (!message) throw new Error("message not found");
     if (request.command === "reply") {
@@ -296,6 +316,10 @@ export class Bridge {
       running: true,
       pid: process.pid,
       threadId: this.codex?.threadId || this.state.threadId,
+      reasoningEffort: this.config.reasoningEffort,
+      nextTurnReasoningEffort: this.codex?.reasoningEffort,
+      effectiveReasoningEffort: this.codex?.effectiveReasoningEffort,
+      fastMode: this.config.fastMode,
       serviceTier: this.codex?.serviceTier,
       priority: this.codex?.serviceTier === "priority",
       spaceBound: Boolean(this.state.spaceId),
@@ -380,6 +404,16 @@ export function splitMessage(text, limit = 4000) {
   }
   if (rest) output.push(rest);
   return output;
+}
+
+export function parseOutboundResponse(text) {
+  const source = String(text || "").trim();
+  const directive = source.match(/^\[\[photon_reaction:(.{1,16})\]\](?:\n|$)/u);
+  if (!directive) return { reaction: null, text: source };
+  return {
+    reaction: directive[1].trim() || null,
+    text: source.slice(directive[0].length).trim(),
+  };
 }
 
 function textInput(text) {
