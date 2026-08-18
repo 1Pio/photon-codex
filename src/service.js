@@ -4,6 +4,7 @@ import { chmod, mkdir, readFile, unlink, writeFile } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
 import os from "node:os";
 import path from "node:path";
+import { codexExecutable, codexHome } from "./codex.js";
 import { appHome, runtimeLogPath } from "./config.js";
 
 export const SERVICE_LABEL = "com.photon-codex.bridge";
@@ -19,7 +20,7 @@ export async function installService(env = process.env) {
   await writeFile(plist, launchAgentPlist(env), { encoding: "utf8", mode: 0o600 });
   await chmod(plist, 0o600);
   runLaunchctl(["bootout", serviceDomain()], { allowFailure: true });
-  runLaunchctl(["bootstrap", userDomain(), plist]);
+  await bootstrapService(plist);
   return serviceStatus(env);
 }
 
@@ -83,6 +84,10 @@ export function serviceStatus(env = process.env) {
 export function launchAgentPlist(env = process.env) {
   const cliPath = fileURLToPath(new URL("./cli.js", import.meta.url));
   const pathValue = env.PATH || "/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin";
+  const executable = codexExecutable(env);
+  const executableEnvironment = executable === "codex"
+    ? ""
+    : `\n    <key>PHOTON_CODEX_BIN</key>\n    <string>${xml(executable)}</string>`;
   return `<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -100,7 +105,9 @@ export function launchAgentPlist(env = process.env) {
     <key>PATH</key>
     <string>${xml(pathValue)}</string>
     <key>PHOTON_CODEX_HOME</key>
-    <string>${xml(appHome(env))}</string>
+    <string>${xml(appHome(env))}</string>${executableEnvironment}
+    <key>CODEX_HOME</key>
+    <string>${xml(codexHome(env))}</string>
   </dict>
   <key>RunAtLoad</key>
   <true/>
@@ -128,6 +135,16 @@ function runLaunchctl(args, { allowFailure = false } = {}) {
     throw new Error((result.stderr || result.stdout || `launchctl ${args[0]} failed`).trim());
   }
   return result;
+}
+
+async function bootstrapService(plist) {
+  let result;
+  for (const delay of [0, 250, 1000]) {
+    if (delay) await new Promise((resolve) => setTimeout(resolve, delay));
+    result = runLaunchctl(["bootstrap", userDomain(), plist], { allowFailure: true });
+    if (result.status === 0) return;
+  }
+  throw new Error((result.stderr || result.stdout || "launchctl bootstrap failed").trim());
 }
 
 function userDomain() {

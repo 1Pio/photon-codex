@@ -7,6 +7,7 @@ import path from "node:path";
 import { createInterface } from "node:readline/promises";
 import { stdin, stdout } from "node:process";
 import { Bridge } from "./bridge.js";
+import { CodexAppServer, codexExecutable, codexHome } from "./codex.js";
 import {
   loadConfig,
   loadState,
@@ -14,6 +15,7 @@ import {
   redactConfig,
   runtimeLogPath,
   saveConfig,
+  saveState,
   setProjectSecret,
   workspacePath,
 } from "./config.js";
@@ -118,8 +120,13 @@ async function doctorResult() {
   } catch (error) {
     checks.push({ check: "config", ok: false, error: error.message });
   }
-  const codex = spawnSync("codex", ["--version"], { encoding: "utf8" });
-  checks.push({ check: "codex", ok: codex.status === 0, value: codex.stdout.trim() || undefined });
+  const executable = codexExecutable();
+  const codex = spawnSync(executable, ["--version"], { encoding: "utf8" });
+  checks.push({
+    check: "codex",
+    ok: codex.status === 0,
+    value: codex.status === 0 ? { executable, home: codexHome(), version: codex.stdout.trim() } : undefined,
+  });
   if (config) {
     try {
       await mkdir(config.cwd, { recursive: true, mode: 0o700 });
@@ -133,9 +140,94 @@ async function doctorResult() {
     } catch (error) {
       checks.push({ check: "photon-auth", ok: false, error: error.message });
     }
+    if (codex.status === 0) {
+      const probe = new CodexAppServer({
+        cwd: config.cwd,
+        ephemeral: true,
+        onThreadId: async () => {},
+      });
+      try {
+        await probe.start();
+        const parity = probe.parityReport();
+        checks.push({ check: "codex-config-parity", ok: parity.inherited, value: parity });
+        checks.push({ check: "codex-auth", ok: probe.account.authenticated, value: probe.account });
+        const capabilities = await capabilityInventory(probe, config.cwd);
+        checks.push({ check: "codex-capabilities", ok: capabilities.ok, value: capabilities });
+        const smoke = await smokeTurn(probe);
+        checks.push({ check: "codex-live-turn", ok: smoke.ok, value: smoke });
+      } catch (error) {
+        checks.push({ check: "codex-config-parity", ok: false, error: error.message });
+      } finally {
+        await probe.stop().catch(() => {});
+      }
+    }
   }
   const ok = checks.every((check) => check.ok);
   return { ok, checks };
+}
+
+async function capabilityInventory(codex, cwd) {
+  const [skills, mcp, apps] = await Promise.all([
+    codex.request("skills/list", { cwds: [cwd], forceReload: false }),
+    codex.request("mcpServerStatus/list", { threadId: codex.threadId, limit: 100, detail: "toolsAndAuthOnly" }),
+    codex.request("app/list", { threadId: codex.threadId, limit: 100, forceRefetch: false }),
+  ]);
+  const skillEntries = skills.data || [];
+  const mcpServers = mcp.data || [];
+  const appEntries = apps.data || [];
+  const errors = skillEntries.flatMap((entry) => entry.errors || []);
+  return {
+    ok: errors.length === 0,
+    skills: skillEntries.reduce((count, entry) => count + (entry.skills?.length || 0), 0),
+    skillErrors: errors.length,
+    mcpServers: mcpServers.length,
+    mcpTools: mcpServers.reduce((count, server) => count + Object.keys(server.tools || {}).length, 0),
+    apps: appEntries.length,
+    enabledApps: appEntries.filter((app) => app.isEnabled).length,
+    accessibleApps: appEntries.filter((app) => app.isAccessible).length,
+  };
+}
+
+async function smokeTurn(codex) {
+  let shellUsed = false;
+  let final = "";
+  let serverRequest = null;
+  let timeout;
+  const completed = new Promise((resolve, reject) => {
+    timeout = setTimeout(() => reject(new Error("Codex live turn timed out")), 90_000);
+    codex.on("notification", function onNotification(method, params) {
+      if (method === "item/completed" && params.item?.type === "commandExecution" && params.item.status === "completed") {
+        shellUsed = true;
+      }
+      if (method === "item/completed" && params.item?.type === "agentMessage") {
+        final = params.item.text?.trim() || final;
+      }
+      if (method === "turn/completed") resolve(params.turn);
+    });
+    codex.on("request", function onRequest(request) {
+      serverRequest = request.method;
+      codex.reject(request.id, "Doctor cannot answer an interactive request");
+    });
+  });
+  try {
+    await codex.startTurn([{
+      type: "text",
+      text: "Run `pwd` using the shell tool. Then reply with exactly PHOTON_CODEX_PARITY_OK and nothing else.",
+      text_elements: [],
+    }]);
+    const turn = await completed;
+    return {
+      ok: turn?.status === "completed" && shellUsed && final === "PHOTON_CODEX_PARITY_OK" && !serverRequest,
+      status: turn?.status || null,
+      shellUsed,
+      exactReply: final === "PHOTON_CODEX_PARITY_OK",
+      interactiveRequest: serverRequest,
+    };
+  } finally {
+    clearTimeout(timeout);
+    codex.removeAllListeners("notification");
+    codex.removeAllListeners("request");
+  }
 }
 
 async function workspaceSet(args) {
@@ -143,6 +235,9 @@ async function workspaceSet(args) {
   await mkdir(cwd, { recursive: true, mode: 0o700 });
   const config = await loadConfig();
   const saved = await saveConfig({ ...config, cwd });
+  const state = await loadState();
+  state.threadId = null;
+  await saveState(state);
   print({ configured: true, restartRequired: true, config: redactConfig(saved) });
 }
 

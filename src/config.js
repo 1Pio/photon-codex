@@ -4,18 +4,6 @@ import os from "node:os";
 import path from "node:path";
 
 const KEYCHAIN_SERVICE = "photon-codex";
-export const DEFAULT_REASONING_EFFORT = "medium";
-export const DEFAULT_FAST_MODE = true;
-
-const REASONING_EFFORTS = new Map([
-  ["light", { label: "light", codex: "low" }],
-  ["low", { label: "light", codex: "low" }],
-  ["medium", { label: "medium", codex: "medium" }],
-  ["high", { label: "high", codex: "high" }],
-  ["extra high", { label: "extra high", codex: "xhigh" }],
-  ["xhigh", { label: "extra high", codex: "xhigh" }],
-  ["max", { label: "max", codex: "max" }],
-]);
 
 export function appHome(env = process.env) {
   return path.resolve(env.PHOTON_CODEX_HOME || path.join(os.homedir(), ".config", "photon-codex"));
@@ -73,38 +61,14 @@ export function normalizeSender(value) {
   return normalized;
 }
 
-export function normalizeReasoningEffort(value = DEFAULT_REASONING_EFFORT) {
-  const key = String(value).trim().toLowerCase().replace(/[_-]+/g, " ").replace(/\s+/g, " ");
-  const effort = REASONING_EFFORTS.get(key);
-  if (!effort) {
-    throw new Error("reasoningEffort must be one of: light, medium, high, extra high, max");
-  }
-  return effort.label;
-}
-
-export function codexReasoningEffort(value = DEFAULT_REASONING_EFFORT) {
-  const label = normalizeReasoningEffort(value);
-  return REASONING_EFFORTS.get(label).codex;
-}
-
-export function normalizeFastMode(value = DEFAULT_FAST_MODE) {
-  if (typeof value !== "boolean") throw new Error("fastMode must be a boolean: true or false");
-  return value;
-}
-
 export async function loadConfig(env = process.env) {
   await ensureHome(env);
   const stored = await readJson(configPath(env), {});
-  const fastMode = env.PHOTON_CODEX_FAST_MODE === undefined
-    ? normalizeFastMode(stored.fastMode ?? DEFAULT_FAST_MODE)
-    : parseEnvironmentBoolean("PHOTON_CODEX_FAST_MODE", env.PHOTON_CODEX_FAST_MODE);
   const config = {
     projectId: env.PHOTON_PROJECT_ID || stored.projectId,
     allowedSender: env.PHOTON_CODEX_ALLOWED_SENDER || stored.allowedSender,
     cwd: path.resolve(env.PHOTON_CODEX_CWD || stored.cwd || workspacePath(env)),
     maxAttachmentBytes: Number(env.PHOTON_CODEX_MAX_ATTACHMENT_BYTES || stored.maxAttachmentBytes || 50 * 1024 * 1024),
-    reasoningEffort: normalizeReasoningEffort(env.PHOTON_CODEX_REASONING_EFFORT ?? stored.reasoningEffort ?? DEFAULT_REASONING_EFFORT),
-    fastMode,
   };
   if (!config.projectId) throw new Error("Photon project ID is missing. Run `photon-codex init`.");
   config.allowedSender = normalizeSender(config.allowedSender);
@@ -120,8 +84,6 @@ export async function saveConfig(config, env = process.env) {
     allowedSender: normalizeSender(config.allowedSender),
     cwd: path.resolve(config.cwd),
     maxAttachmentBytes: Number(config.maxAttachmentBytes || 50 * 1024 * 1024),
-    reasoningEffort: normalizeReasoningEffort(config.reasoningEffort ?? DEFAULT_REASONING_EFFORT),
-    fastMode: normalizeFastMode(config.fastMode ?? DEFAULT_FAST_MODE),
   };
   if (!value.projectId) throw new Error("projectId is required");
   await ensureHome(env);
@@ -131,12 +93,13 @@ export async function saveConfig(config, env = process.env) {
 
 export function emptyState() {
   return {
-    version: 2,
+    version: 3,
     threadId: null,
     spaceId: null,
     acceptedMessageIds: [],
     repliedMessageIds: [],
     ignoredEventIds: [],
+    messageQueue: [],
     control: null,
     runtime: {
       startedAt: null,
@@ -166,6 +129,7 @@ export async function saveState(state, env = process.env) {
 
 export function normalizeState(state = {}) {
   const defaults = emptyState();
+  const resetsLegacyThread = Number(state.version || 0) < 3;
   const legacyIds = Array.isArray(state.seenMessageIds) ? state.seenMessageIds : [];
   const legacyReceipts = legacyIds.filter(isReceiptEventId);
   const acceptedMessageIds = state.acceptedMessageIds || legacyIds.filter((id) => !isReceiptEventId(id));
@@ -178,10 +142,12 @@ export function normalizeState(state = {}) {
   return {
     ...defaults,
     ...state,
-    version: 2,
+    version: 3,
+    threadId: resetsLegacyThread ? null : state.threadId || null,
     acceptedMessageIds: boundedIds(acceptedMessageIds),
     repliedMessageIds: boundedIds(state.repliedMessageIds),
     ignoredEventIds: boundedIds(ignoredEventIds),
+    messageQueue: normalizeMessageQueue(state.messageQueue),
     runtime,
     control: state.control || null,
     seenMessageIds: undefined,
@@ -190,6 +156,13 @@ export function normalizeState(state = {}) {
 
 function boundedIds(ids) {
   return Array.from(new Set(Array.isArray(ids) ? ids : [])).slice(-512);
+}
+
+function normalizeMessageQueue(values) {
+  if (!Array.isArray(values)) return [];
+  return values.filter((entry) =>
+    entry && typeof entry.messageId === "string" && Array.isArray(entry.input),
+  ).slice(-100).map((entry) => ({ messageId: entry.messageId, input: entry.input }));
 }
 
 function isReceiptEventId(id) {
@@ -230,14 +203,5 @@ export function redactConfig(config) {
     allowedSender: `${config.allowedSender.slice(0, 4)}…${config.allowedSender.slice(-3)}`,
     cwd: config.cwd,
     maxAttachmentBytes: config.maxAttachmentBytes,
-    reasoningEffort: config.reasoningEffort,
-    fastMode: config.fastMode,
   };
-}
-
-function parseEnvironmentBoolean(name, value) {
-  const normalized = String(value).trim().toLowerCase();
-  if (normalized === "true") return true;
-  if (normalized === "false") return false;
-  throw new Error(`${name} must be true or false`);
 }

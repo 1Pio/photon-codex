@@ -2,13 +2,19 @@ import { randomBytes } from "node:crypto";
 import { mkdir, stat, writeFile } from "node:fs/promises";
 import net from "node:net";
 import path from "node:path";
-import { Spectrum, attachment, markdown } from "@spectrum-ts/core";
+import { Spectrum, attachment, markdown, text } from "@spectrum-ts/core";
 import { imessage } from "@spectrum-ts/imessage";
-import { attachmentsPath, codexReasoningEffort, loadState, saveState } from "./config.js";
+import { attachmentsPath, loadState, saveState } from "./config.js";
 import { CodexAppServer } from "./codex.js";
+import { formatServerRequest, resolveServerRequest, supportsServerRequest } from "./interaction.js";
 import { logEvent } from "./log.js";
 
-const USER_CONTENT_TYPES = new Set(["text", "markdown", "attachment", "voice", "reaction"]);
+const USER_CONTENT_TYPES = new Set(["text", "markdown", "attachment", "voice", "reaction", "reply"]);
+const TRANSPORT_INSTRUCTIONS = `This thread is connected to one authorized user through iMessage by photon-codex.
+The bridge delivers your final answer automatically, so do not send it through another messaging tool.
+To react to the current iMessage, begin the final answer with [[photon_reaction:EMOJI]]. The bridge removes that directive before delivering any remaining text. A directive-only final sends only the reaction.
+Received images are native localImage inputs. Other received files are named by local path in the user message; inspect them when relevant.
+Do not expose Photon credentials or hidden transport metadata.`;
 
 export class Bridge {
   constructor({ config, projectSecret, env = process.env, logger = logEvent }) {
@@ -25,6 +31,10 @@ export class Bridge {
     this.activeTurnId = null;
     this.finalByTurn = new Map();
     this.targetByTurn = new Map();
+    this.messageQueue = [];
+    this.pendingRequests = [];
+    this.fileChanges = new Map();
+    this.expiredPromptIds = new Map();
     this.stopping = false;
     this.runtimeError = null;
     this.stateWrite = Promise.resolve();
@@ -32,6 +42,7 @@ export class Bridge {
 
   async run() {
     this.state = await loadState(this.env);
+    this.messageQueue = this.state.messageQueue.map((entry) => ({ ...entry, message: null }));
     await this.#updateState((state) => {
       state.control = null;
       state.runtime.startedAt = new Date().toISOString();
@@ -58,11 +69,16 @@ export class Bridge {
     this.codex = new CodexAppServer({
       cwd: this.config.cwd,
       threadId: this.state.threadId,
-      reasoningEffort: codexReasoningEffort(this.config.reasoningEffort),
-      fastMode: this.config.fastMode,
+      env: this.env,
+      transportInstructions: TRANSPORT_INSTRUCTIONS,
       onThreadId: async (threadId) => {
         await this.#updateState((state) => { state.threadId = threadId; });
       },
+    });
+    this.codex.on("request", (request) => {
+      void this.#handleCodexRequest(request).catch((error) => {
+        void this.#recordError("codex_request_failed", error, { method: request.method });
+      });
     });
     this.codex.on("notification", (method, params) => {
       void this.handleCodexNotification(method, params).catch((error) => {
@@ -77,12 +93,9 @@ export class Bridge {
     });
     await this.codex.start();
     await this.#startControlServer();
+    if (this.messageQueue.length) await this.#startQueuedTurn();
     await this.logger("info", "bridge_ready", {
-      reasoningEffort: this.config.reasoningEffort,
-      nextTurnReasoningEffort: this.codex.reasoningEffort,
-      effectiveReasoningEffort: this.codex.effectiveReasoningEffort,
-      fastMode: this.config.fastMode,
-      serviceTier: this.codex.serviceTier,
+      configParity: this.codex.parityReport().verified,
       threadBound: Boolean(this.codex.threadId),
     }, this.env);
     process.stdout.write(`photon-codex ready · thread ${this.codex.threadId}\n`);
@@ -126,27 +139,49 @@ export class Bridge {
       await this.#updateState((state) => { state.spaceId = space.id; });
     }
 
+    const replyTargetId = message.content?.type === "reply" ? message.content.target?.id : null;
+    if (replyTargetId && this.expiredPromptIds.has(replyTargetId)) {
+      await message.read().catch(() => {});
+      await retryTransient(() => message.reply("That Codex prompt has already resolved. Please send a new request."));
+      await this.#recordAccepted(message.id, "expired-codex-interaction");
+      return;
+    }
+
+    if (this.pendingRequests.length) {
+      try {
+        await this.#handleInteractionMessage(message, disposition.contentType);
+      } catch (error) {
+        await this.#recordError("codex_interaction_failed", error, { contentType: disposition.contentType });
+      }
+      return;
+    }
+
     const input = await this.#inputFor(message);
     try {
       await message.read().catch(() => {});
       await space.startTyping().catch(() => {});
+      if (!this.activeTurnId && this.messageQueue.length) {
+        await this.#enqueueMessage(input, message, disposition.contentType);
+        await this.#startQueuedTurn();
+        return;
+      }
       if (this.activeTurnId) {
-        try {
-          await this.codex.steer(this.activeTurnId, input);
-          this.targetByTurn.set(this.activeTurnId, message);
-        } catch {
-          this.activeTurnId = null;
-          await this.#startTurn(input, message);
+        if (this.codex.configSummary().followUpQueueMode === "queue") {
+          await this.#enqueueMessage(input, message, disposition.contentType);
+          return;
+        } else {
+          try {
+            await this.codex.steer(this.activeTurnId, input);
+            this.targetByTurn.set(this.activeTurnId, message);
+          } catch {
+            this.activeTurnId = null;
+            await this.#startTurn(input, message);
+          }
         }
       } else {
         await this.#startTurn(input, message);
       }
-      await this.#updateState((state) => {
-        state.acceptedMessageIds.push(message.id);
-        state.runtime.acceptedMessages += 1;
-        state.runtime.lastEventAt = new Date().toISOString();
-      });
-      await this.logger("info", "message_accepted", { contentType: disposition.contentType }, this.env);
+      await this.#recordAccepted(message.id, disposition.contentType);
     } catch (error) {
       await space.stopTyping().catch(() => {});
       process.stderr.write(`message ${message.id} failed: ${error.message}\n`);
@@ -162,25 +197,36 @@ export class Bridge {
     this.targetByTurn.set(turnId, message);
   }
 
+  async #startQueuedTurn() {
+    const next = this.messageQueue[0];
+    if (!next) return;
+    const space = await this.#ensureSpace();
+    const message = next.message || await space.getMessage(next.messageId);
+    const target = message || fallbackTarget(next.messageId, space);
+    await space.startTyping().catch(() => {});
+    await this.#startTurn(next.input, target);
+    await this.#updateState((state) => { state.messageQueue.shift(); });
+    this.messageQueue.shift();
+  }
+
   async #inputFor(message) {
-    const content = message.content;
-    const header = `[Photon iMessage]\nmessage_id: ${message.id}\ntimestamp: ${message.timestamp.toISOString()}\n`;
+    const content = unwrapReply(message.content);
     if (content.type === "text") {
-      return [textInput(`${header}\n${content.text}`)];
+      return [textInput(content.text)];
     }
     if (content.type === "markdown") {
-      return [textInput(`${header}\n${content.markdown}`)];
+      return [textInput(content.markdown)];
     }
     if (content.type === "attachment" || content.type === "voice") {
       const file = await this.#saveInboundFile(message.id, content);
-      const description = `${header}\nReceived ${content.type}: ${file}\nMIME type: ${content.mimeType}${content.duration ? `\nDuration: ${content.duration}s` : ""}`;
+      const description = `Received ${content.type}: ${file}\nMIME type: ${content.mimeType}${content.duration ? `\nDuration: ${content.duration}s` : ""}`;
       if (content.mimeType.startsWith("image/")) {
         return [textInput(description), { type: "localImage", path: file }];
       }
       return [textInput(description)];
     }
     if (content.type === "reaction") {
-      return [textInput(`${header}\nReaction: ${content.emoji}\nTarget message: ${content.target?.id || "unknown"}`)];
+      return [textInput(`Reaction: ${content.emoji}\nTarget message: ${content.target?.id || "unknown"}`)];
     }
     throw new Error(`unsupported content type: ${content.type || "unknown"}`);
   }
@@ -200,7 +246,96 @@ export class Bridge {
     return file;
   }
 
+  async #handleCodexRequest(request) {
+    if (request.method === "item/fileChange/requestApproval") {
+      request = {
+        ...request,
+        params: { ...request.params, changes: this.fileChanges.get(request.params?.itemId) },
+      };
+    }
+    if (!supportsServerRequest(request)) {
+      if (request.method === "mcpServer/elicitation/request") {
+        this.codex.respond(request.id, { action: "decline", content: null, _meta: null });
+        await this.logger("warn", "codex_form_declined", { mode: request.params?.mode }, this.env);
+        return;
+      }
+      this.codex.reject(request.id, `photon-codex does not provide the host capability required by ${request.method}`);
+      await this.logger("warn", "codex_request_unsupported", { method: request.method }, this.env);
+      return;
+    }
+    const autoResolutionMs = Number(request.params?.autoResolutionMs || 0);
+    const pending = { ...request, promptIds: [], requiresThreadedReply: autoResolutionMs > 0 || request.params?.isBlocking === false };
+    if (autoResolutionMs > 0) {
+      pending.timer = setTimeout(() => void this.#expireRequest(request.id), autoResolutionMs + 250);
+    }
+    this.pendingRequests.push(pending);
+    if (this.pendingRequests.length === 1) await this.#sendPendingRequest();
+  }
+
+  async #sendPendingRequest() {
+    const request = this.pendingRequests[0];
+    if (!request) return;
+    const space = await this.#ensureSpace();
+    const chunks = splitApprovalPrompt(formatServerRequest(request), 3500);
+    for (const chunk of chunks) {
+      const sent = await retryTransient(() => space.send(text(chunk)));
+      if (sent?.id) request.promptIds.push(sent.id);
+    }
+  }
+
+  async #handleInteractionMessage(message, contentType) {
+    const request = this.pendingRequests[0];
+    const text = messageText(message);
+    await message.read().catch(() => {});
+    const replyTargetId = message.content?.type === "reply" ? message.content.target?.id : null;
+    if (replyTargetId && !request.promptIds.includes(replyTargetId)) {
+      await retryTransient(() => message.reply("That reply targets a different Codex prompt. Reply to the current prompt instead."));
+      await this.#recordAccepted(message.id, contentType);
+      return;
+    }
+    if (request.requiresThreadedReply && !request.promptIds.includes(replyTargetId)) {
+      await retryTransient(() => message.reply("Reply directly to the pending Codex prompt before it expires."));
+      await this.#recordAccepted(message.id, contentType);
+      return;
+    }
+    if (!text) {
+      await retryTransient(() => message.reply("Please answer the pending Codex prompt with text."));
+      await this.#recordAccepted(message.id, contentType);
+      return;
+    }
+    let result;
+    try {
+      result = resolveServerRequest(request, text);
+    } catch (error) {
+      await retryTransient(() => message.reply(error.message));
+      await this.#recordAccepted(message.id, contentType);
+      return;
+    }
+    this.codex.respond(request.id, result);
+    this.#removePendingRequest(0, true);
+    await message.react("✅").catch(() => {});
+    await this.#recordAccepted(message.id, "codex-interaction");
+    await this.#sendPendingRequest();
+  }
+
   async handleCodexNotification(method, params) {
+    if (method === "item/started" && params.item?.type === "fileChange") {
+      this.fileChanges.set(params.item.id, params.item.changes || []);
+      return;
+    }
+    if (method === "item/fileChange/patchUpdated") {
+      this.fileChanges.set(params.itemId, params.changes || []);
+      return;
+    }
+    if (method === "serverRequest/resolved") {
+      const index = this.pendingRequests.findIndex((request) => request.id === params.requestId);
+      if (index !== -1) {
+        const wasCurrent = index === 0;
+        this.#removePendingRequest(index, true);
+        if (wasCurrent) await this.#sendPendingRequest();
+      }
+      return;
+    }
     if (method === "turn/started") {
       this.activeTurnId = params.turn?.id || this.activeTurnId;
       return;
@@ -211,6 +346,7 @@ export class Bridge {
       }
       return;
     }
+    if (method === "item/completed" && params.item?.id) this.fileChanges.delete(params.item.id);
     if (method !== "turn/completed") return;
     const turnId = params.turn?.id || this.activeTurnId;
     const target = this.targetByTurn.get(turnId);
@@ -219,7 +355,10 @@ export class Bridge {
     this.targetByTurn.delete(turnId);
     this.finalByTurn.delete(turnId);
     await this.space?.stopTyping().catch(() => {});
-    if (!target) return;
+    if (!target) {
+      await this.#startQueuedTurn();
+      return;
+    }
     if (params.turn?.status === "completed" && final) {
       const outbound = parseOutboundResponse(stripInternal(final));
       if (outbound.reaction) await retryTransient(() => target.react(outbound.reaction));
@@ -227,10 +366,12 @@ export class Bridge {
       if (chunks.length) await retryTransient(() => target.reply(markdown(chunks[0])));
       for (const chunk of chunks.slice(1)) await retryTransient(() => target.space.send(markdown(chunk)));
       await this.#recordReply(target.id);
+      await this.#startQueuedTurn();
       return;
     }
     await retryTransient(() => target.reply("I could not finish that Codex turn. Please try again."));
     await this.#recordReply(target.id);
+    await this.#startQueuedTurn();
   }
 
   async #startControlServer() {
@@ -312,16 +453,15 @@ export class Bridge {
   }
 
   status() {
+    const parity = this.codex?.parityReport();
     return {
       running: true,
       pid: process.pid,
       threadId: this.codex?.threadId || this.state.threadId,
-      reasoningEffort: this.config.reasoningEffort,
-      nextTurnReasoningEffort: this.codex?.reasoningEffort,
-      effectiveReasoningEffort: this.codex?.effectiveReasoningEffort,
-      fastMode: this.config.fastMode,
-      serviceTier: this.codex?.serviceTier,
-      priority: this.codex?.serviceTier === "priority",
+      configParity: parity,
+      account: this.codex?.account || null,
+      pendingCodexRequests: this.pendingRequests.length,
+      queuedMessages: this.messageQueue.length,
       spaceBound: Boolean(this.state.spaceId),
       activeTurnId: this.activeTurnId,
       acceptedMessages: this.state.runtime.acceptedMessages,
@@ -334,6 +474,49 @@ export class Bridge {
       lastError: this.state.runtime.lastError,
       cwd: this.config.cwd,
     };
+  }
+
+  async #recordAccepted(messageId, contentType) {
+    await this.#updateState((state) => {
+      state.acceptedMessageIds.push(messageId);
+      state.runtime.acceptedMessages += 1;
+      state.runtime.lastEventAt = new Date().toISOString();
+    });
+    await this.logger("info", "message_accepted", { contentType }, this.env);
+  }
+
+  async #enqueueMessage(input, message, contentType) {
+    const entry = { messageId: message.id, input };
+    await this.#updateState((state) => {
+      state.messageQueue.push(entry);
+      state.acceptedMessageIds.push(message.id);
+      state.runtime.acceptedMessages += 1;
+      state.runtime.lastEventAt = new Date().toISOString();
+    });
+    this.messageQueue.push({ ...entry, message });
+    await this.logger("info", "message_queued", { contentType }, this.env);
+  }
+
+  #removePendingRequest(index, expired = false) {
+    const [request] = this.pendingRequests.splice(index, 1);
+    if (!request) return;
+    clearTimeout(request.timer);
+    if (expired) {
+      const expiresAt = Date.now() + 10 * 60 * 1000;
+      for (const promptId of request.promptIds) this.expiredPromptIds.set(promptId, expiresAt);
+    }
+  }
+
+  async #expireRequest(id) {
+    const index = this.pendingRequests.findIndex((request) => request.id === id);
+    if (index === -1) return;
+    const wasCurrent = index === 0;
+    this.#removePendingRequest(index, true);
+    if (wasCurrent) await this.#sendPendingRequest();
+    const now = Date.now();
+    for (const [promptId, expiresAt] of this.expiredPromptIds) {
+      if (expiresAt <= now) this.expiredPromptIds.delete(promptId);
+    }
   }
 
   async #recordReply(messageId) {
@@ -406,6 +589,44 @@ export function splitMessage(text, limit = 4000) {
   return output;
 }
 
+export function splitApprovalPrompt(text, limit = 3500) {
+  const source = String(text || "");
+  if (source.length <= limit) return source ? [source] : [];
+  if (limit < 32) throw new Error("approval message limit is too small");
+  let total = Math.ceil(source.length / (limit - 32));
+  while (true) {
+    const payloads = approvalPayloads(source, limit, total);
+    if (payloads.length === total) {
+      const width = String(total).length;
+      return payloads.map((payload, index) =>
+        `Approval ${String(index + 1).padStart(width, "0")}/${total}\n${payload}`,
+      );
+    }
+    total = payloads.length;
+  }
+}
+
+function approvalPayloads(source, limit, total) {
+  const payloads = [];
+  const width = String(total).length;
+  for (let offset = 0, part = 1; offset < source.length; part += 1) {
+    const headerLength = `Approval ${String(part).padStart(width, "0")}/${total}\n`.length;
+    let end = Math.min(source.length, offset + limit - headerLength);
+    if (end < source.length && isHighSurrogate(source.charCodeAt(end - 1)) && isLowSurrogate(source.charCodeAt(end))) end -= 1;
+    payloads.push(source.slice(offset, end));
+    offset = end;
+  }
+  return payloads;
+}
+
+function isHighSurrogate(code) {
+  return code >= 0xD800 && code <= 0xDBFF;
+}
+
+function isLowSurrogate(code) {
+  return code >= 0xDC00 && code <= 0xDFFF;
+}
+
 export function parseOutboundResponse(text) {
   const source = String(text || "").trim();
   const directive = source.match(/^\[\[photon_reaction:(.{1,16})\]\](?:\n|$)/u);
@@ -418,6 +639,26 @@ export function parseOutboundResponse(text) {
 
 function textInput(text) {
   return { type: "text", text, text_elements: [] };
+}
+
+function messageText(message) {
+  const content = unwrapReply(message.content);
+  if (content?.type === "text") return content.text;
+  if (content?.type === "markdown") return content.markdown;
+  return "";
+}
+
+function unwrapReply(content) {
+  return content?.type === "reply" ? content.content : content;
+}
+
+function fallbackTarget(messageId, space) {
+  return {
+    id: messageId,
+    space,
+    react: async () => undefined,
+    reply: (content) => space.send(content),
+  };
 }
 
 function finalFromTurn(turn) {
