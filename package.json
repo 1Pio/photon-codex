@@ -1,0 +1,40 @@
+{
+  "name": "photon-codex",
+  "version": "0.1.0",
+  "description": "A small, direct bridge between Photon iMessage and a persistent Codex thread.",
+  "type": "module",
+  "files": [
+    "src",
+    ".env.example",
+    "LICENSE",
+    "README.md"
+  ],
+  "bin": {
+    "photon-codex": "./src/cli.js"
+  },
+  "scripts": {
+    "start": "node src/cli.js run",
+    "doctor": "node src/cli.js doctor",
+    "test": "node --test"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "@spectrum-ts/core": "^12.7.0",
+    "@spectrum-ts/imessage": "^12.7.0"
+  },
+  "overrides": {
+    "@opentelemetry/core": "2.9.0",
+    "undici": "7.29.0"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/1Pio/photon-codex.git"
+  },
+  "bugs": {
+    "url": "https://github.com/1Pio/photon-codex/issues"
+  },
+  "homepage": "https://github.com/1Pio/photon-codex#readme",
+  "license": "MIT"
+}
