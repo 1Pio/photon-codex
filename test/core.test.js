@@ -7,6 +7,10 @@ import path from "node:path";
 import test from "node:test";
 import {
   Bridge,
+  IMESSAGE_EDIT_WINDOW_MS,
+  PROGRESS_EDIT_LIMIT,
+  isPlainTextFinal,
+  normalizeMessageStack,
   normalizeMimeType,
   normalizePhone,
   normalizeReaction,
@@ -270,6 +274,19 @@ test("accepts one complete emoji grapheme and a strict MIME type", () => {
   assert.throws(() => normalizeMimeType("application/pdf\r\nX-Test: yes"), /valid MIME type/);
 });
 
+test("validates ordered message stacks and conservative plain-text finals", () => {
+  const messages = ["found it", "• cause: fixed\n• result: verified", "🔗 https://example.com"];
+  assert.deepEqual(normalizeMessageStack(messages), messages);
+  assert.equal(isPlainTextFinal("Done. The check passed ✅"), true);
+  assert.equal(isPlainTextFinal("**Done.**"), false);
+  assert.equal(isPlainTextFinal("_Done._"), false);
+  assert.equal(isPlainTextFinal("*Done.*"), false);
+  assert.equal(isPlainTextFinal("- first\n- second"), false);
+  assert.equal(isPlainTextFinal("[open it](https://example.com)"), false);
+  assert.throws(() => normalizeMessageStack(["only one"]), /at least two/);
+  assert.throws(() => normalizeMessageStack(["one", "   "]), /must contain text/);
+});
+
 test("snapshots and fingerprints an outbound file before Spectrum reads it", async () => {
   const home = await mkdtemp(path.join(os.tmpdir(), "photon-codex-send-file-"));
   const file = path.join(home, "brief.pdf");
@@ -478,6 +495,41 @@ test("authenticates the bounded control preface before accepting a framed attach
   }
 });
 
+test("carries edit, progress, and message-stack commands through the bounded control protocol", async () => {
+  const token = "test-message-control-token";
+  const received = [];
+  const server = await startControlServer({
+    token,
+    maxAttachmentBytes: 4,
+    handle: async (request) => {
+      received.push(request);
+      return { command: request.command };
+    },
+  });
+  const port = server.address().port;
+  try {
+    assert.deepEqual(await controlRequest({ port, token, command: "progress", body: { text: "checking" } }), {
+      command: "progress",
+    });
+    assert.deepEqual(await controlRequest({
+      port,
+      token,
+      command: "edit",
+      body: { messageId: "outbound-1", text: "still checking" },
+    }), { command: "edit" });
+    assert.deepEqual(await controlRequest({
+      port,
+      token,
+      command: "send-stack",
+      body: { messages: ["one", "two\nlines", "😀"] },
+    }), { command: "send-stack" });
+    assert.deepEqual(received.map(({ command }) => command), ["progress", "edit", "send-stack"]);
+  } finally {
+    server.destroyControlConnections();
+    await new Promise((resolve) => server.close(resolve));
+  }
+});
+
 test("persists only allowlisted content-free log and last-error fields", async () => {
   const home = await mkdtemp(path.join(os.tmpdir(), "photon-codex-safe-log-"));
   const env = { PHOTON_CODEX_HOME: home };
@@ -500,6 +552,20 @@ test("persists only allowlisted content-free log and last-error fields", async (
       ...hostile,
     }, env);
     await logEvent("error", hostile.message, hostile, env);
+    await logEvent("warn", "message_edit_failed", {
+      phase: "control",
+      errorCategory: "photon",
+      errorCode: "provider_rejected",
+      ...hostile,
+    }, env);
+    await logEvent("warn", "stack_send_failed", {
+      count: 3,
+      failedIndex: 1,
+      sentCount: 1,
+      errorCategory: "photon",
+      errorCode: "provider_rejected",
+      ...hostile,
+    }, env);
 
     const state = emptyState();
     state.runtime.lastError = { ...safe, detail: Object.values(hostile).join(" | ") };
@@ -513,6 +579,8 @@ test("persists only allowlisted content-free log and last-error fields", async (
     const entries = storedLog.trim().split("\n").map(JSON.parse);
     assert.deepEqual(Object.keys(entries[0]).sort(), ["contentType", "errorCategory", "errorCode", "event", "level", "time"]);
     assert.equal(entries[1].event, "log_event_rejected");
+    assert.deepEqual(Object.keys(entries[2]).sort(), ["errorCategory", "errorCode", "event", "level", "phase", "time"]);
+    assert.deepEqual(Object.keys(entries[3]).sort(), ["count", "errorCategory", "errorCode", "event", "failedIndex", "level", "sentCount", "time"]);
     assert.deepEqual((await loadState(env)).runtime.lastError, safe);
   } finally {
     await rm(home, { recursive: true, force: true });
@@ -543,6 +611,389 @@ test("normalizes aliases and requires a provider receipt for direct reactions", 
     () => bridge.reactToMessage({ messageId: "message-1", emoji: "👍" }),
     /did not return.*reaction.*receipt/,
   );
+});
+
+test("tracks one active progress bubble, reserves edit five, and edits a plain final in place", async () => {
+  const home = await mkdtemp(path.join(os.tmpdir(), "photon-codex-progress-"));
+  const edits = [];
+  const replies = [];
+  const events = [];
+  try {
+    const sent = {
+      id: "progress-1",
+      direction: "outbound",
+      timestamp: new Date(),
+      content: { type: "text", text: "Checking the bridge" },
+      edit: async (builder) => { edits.push(await builder.build()); },
+    };
+    const space = {
+      id: "space-1",
+      send: async () => sent,
+      stopTyping: async () => {},
+    };
+    const bridge = new Bridge({
+      config: { projectId: "project", allowedSender: TEST_SENDER, cwd: home, maxAttachmentBytes: 1024 },
+      projectSecret: "secret",
+      env: { ...process.env, PHOTON_CODEX_HOME: home },
+      logger: async (level, event, details) => events.push({ level, event, details }),
+    });
+    bridge.state = { ...emptyState(), spaceId: "space-1" };
+    bridge.space = space;
+    bridge.activeTurnId = "turn-1";
+    bridge.targetByTurn.set("turn-1", {
+      id: "inbound-1",
+      reply: async (content) => { replies.push(await content.build()); },
+      space,
+    });
+
+    const progress = await bridge.sendProgress({ text: "Checking the bridge" });
+    assert.equal(progress.messageId, "progress-1");
+    assert.equal(progress.remainingProgressEdits, PROGRESS_EDIT_LIMIT);
+    assert.equal(progress.finalEditReserved, true);
+
+    let receipt;
+    for (let index = 1; index <= PROGRESS_EDIT_LIMIT; index += 1) {
+      receipt = await bridge.editMessage({ messageId: "progress-1", text: `Progress ${index}` });
+      assert.equal(receipt.observedEdits, index);
+      assert.equal(receipt.remainingProgressEdits, PROGRESS_EDIT_LIMIT - index);
+    }
+    assert.match(receipt.warning, /fifth.*reserved/i);
+    await assert.rejects(
+      () => bridge.editMessage({ messageId: "progress-1", text: "Do not spend edit five" }),
+      /fifth iMessage edit is reserved/,
+    );
+
+    bridge.finalByTurn.set("turn-1", "Finished cleanly ✅");
+    await bridge.handleCodexNotification("turn/completed", {
+      turn: { id: "turn-1", status: "completed", items: [] },
+    });
+
+    assert.equal(edits.length, 5);
+    assert.deepEqual(edits.at(-1), { type: "text", text: "Finished cleanly ✅" });
+    assert.equal(replies.length, 0);
+    assert.equal(bridge.deliveryByTurn.size, 0);
+    assert.deepEqual(bridge.state.repliedMessageIds, ["inbound-1"]);
+    assert.equal(events.filter(({ event }) => event === "message_edited").at(-1).details.phase, "final_answer");
+  } finally {
+    await rm(home, { recursive: true, force: true });
+  }
+});
+
+test("edits an earlier outbound text message directly and rejects inbound or expired targets", async () => {
+  const edited = [];
+  const messages = new Map();
+  const current = {
+    id: "outbound-current",
+    direction: "outbound",
+    timestamp: new Date(),
+    content: { type: "text", text: "draft" },
+    edit: async (builder) => { edited.push(await builder.build()); },
+  };
+  messages.set(current.id, current);
+  messages.set("inbound", {
+    id: "inbound",
+    direction: "inbound",
+    timestamp: new Date(),
+    content: { type: "text", text: "user text" },
+    edit: async () => { throw new Error("should not run"); },
+  });
+  messages.set("expired", {
+    id: "expired",
+    direction: "outbound",
+    timestamp: new Date(Date.now() - IMESSAGE_EDIT_WINDOW_MS),
+    content: { type: "text", text: "old" },
+    edit: async () => { throw new Error("should not run"); },
+  });
+  const bridge = new Bridge({
+    config: { projectId: "project", allowedSender: TEST_SENDER, cwd: "/tmp", maxAttachmentBytes: 1024 },
+    projectSecret: "secret",
+    logger: async () => {},
+  });
+  bridge.state = { ...emptyState(), spaceId: "space-1" };
+  bridge.space = { getMessage: async (id) => messages.get(id) };
+
+  const result = await bridge.editMessage({ messageId: current.id, text: "final" });
+  assert.equal(result.edited, true);
+  assert.equal(result.observedEdits, null);
+  assert.match(result.warning, /Earlier edits.*not observable/);
+  assert.deepEqual(edited, [{ type: "text", text: "final" }]);
+  await assert.rejects(() => bridge.editMessage({ messageId: "inbound", text: "no" }), /only outbound/);
+  await assert.rejects(() => bridge.editMessage({ messageId: "expired", text: "late" }), /15-minute.*expired/);
+});
+
+test("falls back to the normal final path when a progress edit fails", async () => {
+  const home = await mkdtemp(path.join(os.tmpdir(), "photon-codex-progress-fallback-"));
+  const replies = [];
+  const events = [];
+  try {
+    const sent = {
+      id: "progress-failure",
+      direction: "outbound",
+      timestamp: new Date(),
+      content: { type: "text", text: "Checking" },
+      edit: async () => { throw new Error("provider rejected edit"); },
+    };
+    const space = { id: "space-1", send: async () => sent, stopTyping: async () => {} };
+    const bridge = new Bridge({
+      config: { projectId: "project", allowedSender: TEST_SENDER, cwd: home, maxAttachmentBytes: 1024 },
+      projectSecret: "secret",
+      env: { ...process.env, PHOTON_CODEX_HOME: home },
+      logger: async (level, event, details) => events.push({ level, event, details }),
+    });
+    bridge.state = { ...emptyState(), spaceId: "space-1" };
+    bridge.space = space;
+    bridge.activeTurnId = "turn-failure";
+    bridge.targetByTurn.set("turn-failure", {
+      id: "inbound-failure",
+      reply: async (content) => { replies.push(await content.build()); return { id: "reply-1" }; },
+      space,
+    });
+    await bridge.sendProgress({ text: "Checking" });
+    bridge.finalByTurn.set("turn-failure", "The complete answer still arrives.");
+
+    await bridge.handleCodexNotification("turn/completed", {
+      turn: { id: "turn-failure", status: "completed", items: [] },
+    });
+
+    assert.deepEqual(replies, [{ type: "markdown", markdown: "The complete answer still arrives." }]);
+    assert.equal(events.some(({ event }) => event === "message_edit_failed"), true);
+    assert.deepEqual(bridge.state.repliedMessageIds, ["inbound-failure"]);
+    assert.equal(bridge.deliveryByTurn.size, 0);
+  } finally {
+    await rm(home, { recursive: true, force: true });
+  }
+});
+
+test("rich, file-bearing, and expired progress finals bypass editing", async (t) => {
+  const cases = [
+    { name: "rich", final: "**Finished.**", configure: () => {} },
+    { name: "long", final: "a".repeat(4001), configure: () => {} },
+    { name: "file", final: "Finished.", configure: (bridge) => { bridge.deliveryByTurn.get("turn-1").hadFile = true; } },
+    { name: "expired", final: "Finished.", configure: (bridge, sent) => { sent.timestamp = new Date(Date.now() - IMESSAGE_EDIT_WINDOW_MS); } },
+  ];
+  for (const scenario of cases) {
+    await t.test(scenario.name, async () => {
+      const home = await mkdtemp(path.join(os.tmpdir(), `photon-codex-progress-${scenario.name}-`));
+      const replies = [];
+      let edits = 0;
+      try {
+        const sent = {
+          id: `progress-${scenario.name}`,
+          direction: "outbound",
+          timestamp: new Date(),
+          content: { type: "text", text: "Checking" },
+          edit: async () => { edits += 1; },
+        };
+        const space = { id: "space-1", send: async () => sent, stopTyping: async () => {} };
+        const bridge = new Bridge({
+          config: { projectId: "project", allowedSender: TEST_SENDER, cwd: home, maxAttachmentBytes: 1024 },
+          projectSecret: "secret",
+          env: { ...process.env, PHOTON_CODEX_HOME: home },
+          logger: async () => {},
+        });
+        bridge.state = { ...emptyState(), spaceId: "space-1" };
+        bridge.space = space;
+        bridge.activeTurnId = "turn-1";
+        bridge.targetByTurn.set("turn-1", {
+          id: `inbound-${scenario.name}`,
+          reply: async (content) => { replies.push(await content.build()); return { id: "reply-1" }; },
+          space,
+        });
+        await bridge.sendProgress({ text: "Checking" });
+        scenario.configure(bridge, sent);
+        bridge.finalByTurn.set("turn-1", scenario.final);
+        await bridge.handleCodexNotification("turn/completed", {
+          turn: { id: "turn-1", status: "completed", items: [] },
+        });
+        assert.equal(edits, 0);
+        assert.equal(replies.length, 1);
+        assert.equal(bridge.deliveryByTurn.size, 0);
+      } finally {
+        await rm(home, { recursive: true, force: true });
+      }
+    });
+  }
+});
+
+test("turn failure clears progress state and sends the existing failure reply", async () => {
+  const home = await mkdtemp(path.join(os.tmpdir(), "photon-codex-progress-turn-failure-"));
+  const replies = [];
+  try {
+    const sent = {
+      id: "progress-turn-failure",
+      direction: "outbound",
+      timestamp: new Date(),
+      content: { type: "text", text: "Checking" },
+      edit: async () => {},
+    };
+    const space = { id: "space-1", send: async () => sent, stopTyping: async () => {} };
+    const bridge = new Bridge({
+      config: { projectId: "project", allowedSender: TEST_SENDER, cwd: home, maxAttachmentBytes: 1024 },
+      projectSecret: "secret",
+      env: { ...process.env, PHOTON_CODEX_HOME: home },
+      logger: async () => {},
+    });
+    bridge.state = { ...emptyState(), spaceId: "space-1" };
+    bridge.space = space;
+    bridge.activeTurnId = "turn-failed";
+    bridge.targetByTurn.set("turn-failed", {
+      id: "inbound-failed",
+      reply: async (content) => { replies.push(content); return { id: "failure-reply" }; },
+      space,
+    });
+    await bridge.sendProgress({ text: "Checking" });
+
+    await bridge.handleCodexNotification("turn/completed", {
+      turn: { id: "turn-failed", status: "failed", items: [] },
+    });
+
+    assert.deepEqual(replies, ["I could not finish that Codex turn. Please try again."]);
+    assert.equal(bridge.deliveryByTurn.size, 0);
+  } finally {
+    await rm(home, { recursive: true, force: true });
+  }
+});
+
+test("sends a complete Unicode stack in order and marks the active turn delivered", async () => {
+  const home = await mkdtemp(path.join(os.tmpdir(), "photon-codex-stack-"));
+  const built = [];
+  const replies = [];
+  try {
+    const space = {
+      id: "space-1",
+      send: async (builder) => {
+        const content = await builder.build();
+        built.push(content);
+        return { id: `stack-${built.length}`, direction: "outbound", timestamp: new Date(), content };
+      },
+      stopTyping: async () => {},
+    };
+    const bridge = new Bridge({
+      config: { projectId: "project", allowedSender: TEST_SENDER, cwd: home, maxAttachmentBytes: 1024 },
+      projectSecret: "secret",
+      env: { ...process.env, PHOTON_CODEX_HOME: home },
+      logger: async () => {},
+    });
+    bridge.state = { ...emptyState(), spaceId: "space-1" };
+    bridge.space = space;
+    bridge.activeTurnId = "turn-stack";
+    bridge.targetByTurn.set("turn-stack", {
+      id: "inbound-stack",
+      reply: async (content) => { replies.push(await content.build()); },
+      space,
+    });
+    const messages = ["found it", "• cause: Unicode ✅\n• fix: ordered", "🔗 https://example.com"];
+
+    const result = await bridge.sendStack({ messages });
+    assert.equal(result.complete, true);
+    assert.deepEqual(result.messages.map(({ messageId }) => messageId), ["stack-1", "stack-2", "stack-3"]);
+    assert.deepEqual(built.map(({ markdown: value }) => value), messages);
+
+    bridge.finalByTurn.set("turn-stack", "This internal final must not duplicate the complete stack.");
+    await bridge.handleCodexNotification("turn/completed", {
+      turn: { id: "turn-stack", status: "completed", items: [] },
+    });
+    assert.equal(replies.length, 0);
+    assert.deepEqual(bridge.state.repliedMessageIds, ["inbound-stack"]);
+    assert.equal(bridge.deliveryByTurn.size, 0);
+  } finally {
+    await rm(home, { recursive: true, force: true });
+  }
+});
+
+test("a complete stack remains the delivered answer when Codex emits no final text", async () => {
+  const home = await mkdtemp(path.join(os.tmpdir(), "photon-codex-stack-no-final-"));
+  const replies = [];
+  try {
+    let sent = 0;
+    const space = {
+      id: "space-1",
+      send: async (builder) => {
+        const content = await builder.build();
+        sent += 1;
+        return { id: `stack-${sent}`, direction: "outbound", timestamp: new Date(), content };
+      },
+      stopTyping: async () => {},
+    };
+    const bridge = new Bridge({
+      config: { projectId: "project", allowedSender: TEST_SENDER, cwd: home, maxAttachmentBytes: 1024 },
+      projectSecret: "secret",
+      env: { ...process.env, PHOTON_CODEX_HOME: home },
+      logger: async () => {},
+    });
+    bridge.state = { ...emptyState(), spaceId: "space-1" };
+    bridge.space = space;
+    bridge.activeTurnId = "turn-stack";
+    bridge.targetByTurn.set("turn-stack", {
+      id: "inbound-stack",
+      reply: async (content) => { replies.push(content); },
+      space,
+    });
+
+    await bridge.sendStack({ messages: ["complete one", "complete two"] });
+    await bridge.handleCodexNotification("turn/completed", {
+      turn: { id: "turn-stack", status: "completed", items: [] },
+    });
+
+    assert.equal(replies.length, 0);
+    assert.deepEqual(bridge.state.repliedMessageIds, ["inbound-stack"]);
+    assert.equal(bridge.deliveryByTurn.size, 0);
+  } finally {
+    await rm(home, { recursive: true, force: true });
+  }
+});
+
+test("reports stack partial delivery exactly and never retries a sent bubble", async () => {
+  const home = await mkdtemp(path.join(os.tmpdir(), "photon-codex-stack-partial-"));
+  const attempts = [];
+  const replies = [];
+  try {
+    const space = {
+      id: "space-1",
+      send: async (builder) => {
+        const content = await builder.build();
+        attempts.push(content.markdown);
+        if (attempts.length === 2) throw new Error("provider rejected second bubble");
+        return { id: "stack-first", direction: "outbound", timestamp: new Date(), content };
+      },
+      stopTyping: async () => {},
+    };
+    const bridge = new Bridge({
+      config: { projectId: "project", allowedSender: TEST_SENDER, cwd: home, maxAttachmentBytes: 1024 },
+      projectSecret: "secret",
+      env: { ...process.env, PHOTON_CODEX_HOME: home },
+      logger: async () => {},
+    });
+    bridge.state = { ...emptyState(), spaceId: "space-1" };
+    bridge.space = space;
+    bridge.activeTurnId = "turn-partial";
+    bridge.targetByTurn.set("turn-partial", {
+      id: "inbound-partial",
+      reply: async (content) => { replies.push(await content.build()); return { id: "reply-final" }; },
+      space,
+    });
+
+    const result = await bridge.sendStack({ messages: ["one", "two", "three"] });
+    assert.deepEqual(attempts, ["one", "two"]);
+    assert.equal(result.complete, false);
+    assert.equal(result.partial, true);
+    assert.equal(result.sentCount, 1);
+    assert.equal(result.firstUnsentIndex, 1);
+    assert.deepEqual(result.messages, [
+      { index: 0, sent: true, messageId: "stack-first" },
+      { index: 1, sent: false, error: { category: "photon", code: "provider_rejected" } },
+      { index: 2, sent: false, notAttempted: true },
+    ]);
+
+    bridge.finalByTurn.set("turn-partial", "two\n\nthree");
+    await bridge.handleCodexNotification("turn/completed", {
+      turn: { id: "turn-partial", status: "completed", items: [] },
+    });
+    assert.equal(replies.length, 1);
+    assert.equal(replies[0].markdown, "two\n\nthree");
+  } finally {
+    await rm(home, { recursive: true, force: true });
+  }
 });
 
 test("ignores Photon read receipts before starting a Codex turn", async () => {
@@ -870,6 +1321,12 @@ test("honors the Codex desktop follow-up queue setting", async () => {
     });
     bridge.state = { ...emptyState(), spaceId: "space-1" };
     bridge.activeTurnId = "turn-active";
+    bridge.deliveryByTurn.set("turn-active", {
+      progress: { message: { id: "old-progress" }, text: "old", editCount: 0 },
+      hadFile: false,
+      stackAttempted: false,
+      stackDelivered: false,
+    });
     bridge.codex = {
       followUpMode: () => "queue",
       steer: async () => { steered += 1; },
@@ -900,6 +1357,7 @@ test("honors the Codex desktop follow-up queue setting", async () => {
     assert.equal(steered, 0);
     assert.equal(bridge.messageQueue.length, 1);
     assert.equal(bridge.messageQueue[0].input[0].text, "next request");
+    assert.equal(bridge.deliveryByTurn.has("turn-active"), false);
     assert.deepEqual(bridge.state.acceptedMessageIds, ["message-queued"]);
     assert.deepEqual(bridge.state.messageQueue, [{ messageId: "message-queued", input: bridge.messageQueue[0].input }]);
 
@@ -930,6 +1388,12 @@ test("steers an active Codex turn when the effective follow-up mode is steer", a
     });
     bridge.state = { ...emptyState(), spaceId: "space-1" };
     bridge.activeTurnId = "turn-active";
+    bridge.deliveryByTurn.set("turn-active", {
+      progress: { message: { id: "old-progress" }, text: "old", editCount: 0 },
+      hadFile: false,
+      stackAttempted: false,
+      stackDelivered: false,
+    });
     bridge.codex = {
       followUpMode: () => "steer",
       steer: async (turnId, input) => { steered.push({ turnId, input }); },
@@ -955,6 +1419,7 @@ test("steers an active Codex turn when the effective follow-up mode is steer", a
     assert.equal(steered.length, 1);
     assert.equal(steered[0].turnId, "turn-active");
     assert.equal(steered[0].input[0].text, "adjust the active turn");
+    assert.equal(bridge.deliveryByTurn.has("turn-active"), false);
     assert.deepEqual(bridge.state.acceptedMessageIds, ["message-steered"]);
     assert.deepEqual(bridge.state.messageQueue, []);
   } finally {

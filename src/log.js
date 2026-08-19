@@ -8,7 +8,7 @@ const CONTENT_TYPES = new Set([
   "attachment", "codex-interaction", "expired-codex-interaction", "markdown", "reaction", "reply", "text", "unknown", "voice",
 ]);
 const OPERATIONS = new Set([
-  "auth", "doctor", "help", "init", "logs", "react", "reply", "run", "send", "send-file", "service", "status", "stop", "thread", "workspace",
+  "auth", "doctor", "edit", "help", "init", "logs", "progress", "react", "reply", "run", "send", "send-file", "send-stack", "service", "status", "stop", "thread", "workspace",
 ]);
 const ERROR_CATEGORIES = new Set(["attachment", "codex", "control", "filesystem", "photon", "runtime"]);
 const ERROR_CODES = new Set([
@@ -19,6 +19,11 @@ const EVENT_FIELDS = new Map([
   ["bridge_ready", { configParity: booleanValue, threadBound: booleanValue }],
   ["bridge_stopped", {}],
   ["file_sent", { size: countValue, providerDelivered: booleanValue }],
+  ["progress_sent", {}],
+  ["message_edited", { phase: (value) => enumValue(value, PHASES) }],
+  ["message_edit_failed", errorFields({ phase: (value) => enumValue(value, PHASES) })],
+  ["stack_sent", { count: countValue }],
+  ["stack_send_failed", errorFields({ count: countValue, failedIndex: countValue, sentCount: countValue })],
   ["reaction_sent", { phase: (value) => enumValue(value, PHASES) }],
   ["reaction_failed", errorFields({ phase: (value) => enumValue(value, PHASES) })],
   ["reaction_directive_invalid", { phase: (value) => enumValue(value, PHASES) }],

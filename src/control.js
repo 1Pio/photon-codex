@@ -6,7 +6,9 @@ export const CONTROL_BODY_LIMIT = 64 * 1024;
 export const CONTROL_IDLE_TIMEOUT_MS = 10_000;
 export const CONTROL_MAX_CONNECTIONS = 16;
 const CONTROL_RESPONSE_LIMIT = 1024 * 1024;
-const CONTROL_COMMANDS = new Set(["status", "stop", "send", "send-file", "reply", "react", "thread-new"]);
+const CONTROL_COMMANDS = new Set([
+  "edit", "progress", "react", "reply", "send", "send-file", "send-stack", "status", "stop", "thread-new",
+]);
 
 export function controlRequestLimit(maxAttachmentBytes) {
   return Math.ceil(maxAttachmentBytes / 3) * 4 + 16 * 1024;
@@ -165,7 +167,7 @@ export function controlRequest({ port, token, command, body = {} }) {
             return;
           }
           phase = "result";
-          if (command === "send-file") socket.setTimeout(0);
+          if (command === "send-file" || command === "send-stack") socket.setTimeout(0);
           else socket.setTimeout(30_000, () => socket.destroy(new Error("control request timed out")));
           socket.write(bodyBuffer);
           continue;

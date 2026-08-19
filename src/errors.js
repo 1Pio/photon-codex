@@ -3,8 +3,10 @@ const ERROR_EVENTS = new Set([
   "codex_interaction_failed",
   "codex_notification_failed",
   "codex_request_failed",
+  "message_edit_failed",
   "message_failed",
   "reaction_failed",
+  "stack_send_failed",
 ]);
 
 const ERROR_CATEGORIES = new Set(["attachment", "codex", "control", "filesystem", "photon", "runtime"]);
@@ -27,8 +29,10 @@ const EVENT_CATEGORIES = new Map([
   ["codex_interaction_failed", "codex"],
   ["codex_notification_failed", "codex"],
   ["codex_request_failed", "codex"],
+  ["message_edit_failed", "photon"],
   ["message_failed", "photon"],
   ["reaction_failed", "photon"],
+  ["stack_send_failed", "photon"],
 ]);
 
 export function safeErrorRecord(event, error) {
@@ -65,7 +69,7 @@ function codeFor(error) {
   if (/timed? out|timeout/.test(message)) return "timeout";
   if (/exceeds|too large|size limit|body limit/.test(message)) return "size_limit";
   if (/not found|no .* found|could not be opened/.test(message)) return "not_found";
-  if (/invalid|malformed|unexpected token|canonical base64|must be|is required|does not match/.test(message)) return "invalid_input";
+  if (/invalid|malformed|unexpected token|canonical base64|must be|is required|does not match|edit window|progress edits .* used/.test(message)) return "invalid_input";
   if (/config|missing|required|not configured/.test(message)) return "configuration";
   if (/did not return|not sent|transfer failed|provider rejected|send error/.test(message)) return "provider_rejected";
   if (/not running|unavailable|exited|stream ended|cannot resume/.test(message)) return "unavailable";

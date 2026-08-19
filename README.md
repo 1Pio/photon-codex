@@ -45,6 +45,15 @@ photon-codex doctor
 photon-codex service install
 ```
 
+The optional bundled skill teaches Codex the iMessage rhythm and transport commands:
+
+```sh
+mkdir -p ~/.agents/skills
+ln -s "$PWD/.agents/skills/photon-codex" ~/.agents/skills/photon-codex
+```
+
+Codex discovers the skill automatically. Restart Codex only if it does not appear.
+
 `auth set` stores the Photon secret in macOS Keychain. The first accepted message locks the bridge to that sender and direct chat. Send it before Codex tries to send a message or file.
 
 On macOS, `service install` adds a per-user LaunchAgent that restarts the bridge after a crash. On Linux or Windows, set `PHOTON_PROJECT_SECRET` and use your normal process supervisor.
@@ -57,6 +66,9 @@ You just send an iMessage. Codex uses the commands below when it needs to operat
 | --- | --- |
 | Check the bridge | `photon-codex status` |
 | Send a message | `photon-codex send "Hello"` |
+| Send ordered bubbles | `photon-codex send-stack "Found it" "Here is the fix"` |
+| Send visible progress | `photon-codex progress "Checking the live service"` |
+| Edit an outbound message | `photon-codex edit MESSAGE_ID "Updated text"` |
 | Send a document | `photon-codex send-file "/path/to/document.pdf" application/pdf` |
 | Reply to a message | `photon-codex reply MESSAGE_ID "Got it"` |
 | Add a reaction | `photon-codex react MESSAGE_ID 👍` |
@@ -65,6 +77,10 @@ You just send an iMessage. Codex uses the commands below when it needs to operat
 | Restart the service | `photon-codex service restart` |
 
 Every control command returns JSON. Run `photon-codex logs 50` to read recent events.
+
+`progress` creates one plain-text status for the active turn. `edit` can update any outbound text message still inside Apple's edit window. Apple currently permits five edits within 15 minutes; photon-codex caps progress updates at four and reserves one edit for a short plain-text final. Rich, long, file-bearing, expired, or failed edits fall back to the normal final delivery path. No progress state survives a restart.
+
+`send-stack` accepts two to sixteen positional arguments and sends them in order. Its JSON result lists one receipt per bubble. A partial result stops at the first failure and reports `firstUnsentIndex`; retry only the unsent suffix. Multiple iMessage sends are not atomic.
 
 `react` accepts `❤️`, `👍`, `👎`, `😂`, `‼️`, and `❓`, along with the aliases `love`, `like`, `dislike`, `laugh`, `emphasize`, and `question`. Any other single emoji uses a custom reaction.
 
@@ -110,7 +126,7 @@ Sent means Photon accepted the message, not that the recipient saw it.
 
 Run `npm test` for the unit tests. Run `npm run test:live` to test against your authenticated Codex app-server.
 
-Protocol references: [Codex app-server](https://learn.chatgpt.com/docs/app-server) and [Spectrum reactions and replies](https://photon.codes/docs/spectrum-ts/reactions-and-replies).
+Protocol references: [Codex app-server](https://learn.chatgpt.com/docs/app-server), [Spectrum edits, reactions, and replies](https://photon.codes/docs/spectrum-ts/reactions-and-replies), and [Apple's iMessage edit limits](https://support.apple.com/en-ae/guide/iphone/iphe67195653/ios).
 
 MIT licensed. photon-codex is independent and is not affiliated with Photon, OpenAI, or Apple. Their names and marks belong to their owners.
 

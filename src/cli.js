@@ -41,6 +41,9 @@ try {
   else if (command === "status") print({ ...(await control("status")), service: serviceStatus() });
   else if (command === "stop") print(await control("stop"));
   else if (command === "send") print(await control("send", { text: args.join(" ") }));
+  else if (command === "send-stack") await sendStack(args);
+  else if (command === "progress") print(await control("progress", { text: args.join(" ") }));
+  else if (command === "edit") print(await control("edit", { messageId: args[0], text: args.slice(1).join(" ") }));
   else if (command === "send-file") await sendFile(args);
   else if (command === "reply") print(await control("reply", { messageId: args[0], text: args.slice(1).join(" ") }));
   else if (command === "react") print(await control("react", { messageId: args[0], emoji: args[1] }));
@@ -268,6 +271,12 @@ async function sendFile(args) {
   }));
 }
 
+async function sendStack(messages) {
+  const result = await control("send-stack", { messages });
+  print(result);
+  if (!result.complete) process.exitCode = 1;
+}
+
 async function serviceInstall() {
   const result = await doctorResult();
   if (!result.ok) throw new Error(`preflight failed: ${result.checks.filter((check) => !check.ok).map((check) => check.check).join(", ")}`);
@@ -364,6 +373,9 @@ function help(exitCode) {
   status
   stop
   send TEXT
+  send-stack "BUBBLE ONE" "BUBBLE TWO" [...]
+  progress TEXT
+  edit MESSAGE_ID TEXT
   send-file PATH [MIME_TYPE]
   reply MESSAGE_ID TEXT
   react MESSAGE_ID EMOJI

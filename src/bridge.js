@@ -11,9 +11,16 @@ import { formatServerRequest, resolveServerRequest, supportsServerRequest } from
 import { logEvent } from "./log.js";
 
 const USER_CONTENT_TYPES = new Set(["text", "markdown", "attachment", "voice", "reaction", "reply"]);
+export const IMESSAGE_EDIT_WINDOW_MS = 15 * 60 * 1000;
+export const IMESSAGE_EDIT_LIMIT = 5;
+export const PROGRESS_EDIT_LIMIT = IMESSAGE_EDIT_LIMIT - 1;
+export const EDIT_TEXT_LIMIT = 4000;
+export const STACK_MESSAGE_LIMIT = 16;
 const TRANSPORT_INSTRUCTIONS = `This thread is connected to one authorized user through iMessage by photon-codex.
 The bridge delivers your final answer automatically, so do not send it through another messaging tool.
 To react to the current iMessage, begin an assistant message with [[photon_reaction:EMOJI]]. Use a directive-only commentary message when the reaction should appear before the final answer, or begin the final answer with it. The bridge removes the directive. Use exactly one emoji grapheme.
+For visible progress, run photon-codex progress "STATUS" once, then photon-codex edit MESSAGE_ID "UPDATED STATUS" only when something material changes. Four progress edits are allowed; the fifth Apple edit is reserved for a plain-text final answer. Edit failures never replace normal final delivery.
+For a complete multi-bubble answer, run photon-codex send-stack "BUBBLE ONE" "BUBBLE TWO" [...]. A complete stack is the turn's delivered answer. On partial failure, do not retry the whole stack; put only the unsent remainder in the normal final answer.
 To send a file the current Codex sandbox can read, run photon-codex send-file "PATH" [MIME_TYPE]. A successful JSON receipt proves Photon accepted the exact byte snapshot; do not describe that as recipient-visible delivery.
 Received images are native localImage inputs. Other received files are named by local path in the user message; inspect them when relevant.
 Do not expose Photon credentials or hidden transport metadata.`;
@@ -34,6 +41,7 @@ export class Bridge {
     this.finalByTurn = new Map();
     this.targetByTurn = new Map();
     this.reactionByTurn = new Map();
+    this.deliveryByTurn = new Map();
     this.messageQueue = [];
     this.pendingRequests = [];
     this.fileChanges = new Map();
@@ -138,6 +146,7 @@ export class Bridge {
       size: snapshot.bytes.byteLength,
       providerDelivered: sent.isDelivered === true,
     }, this.env);
+    if (this.activeTurnId) this.#deliveryRecord(this.activeTurnId).hadFile = true;
     return {
       providerAccepted: true,
       messageId: sent.id,
@@ -150,6 +159,81 @@ export class Bridge {
       isSent: sent.isSent ?? null,
       isDelivered: sent.isDelivered ?? null,
       transferState: metadata?.transferState ?? null,
+    };
+  }
+
+  async sendProgress({ text: value }) {
+    if (!this.activeTurnId) throw new Error("progress requires an active Codex turn");
+    const body = editableText(value);
+    const space = await this.#ensureSpace();
+    const sent = requireProviderReceipt(await space.send(text(body)), "progress message");
+    const delivery = this.#deliveryRecord(this.activeTurnId);
+    delivery.progress = {
+      message: sent,
+      text: body,
+      editCount: 0,
+    };
+    await this.logger("info", "progress_sent", {}, this.env);
+    return progressReceipt(delivery.progress);
+  }
+
+  async editMessage({ messageId, text: value }) {
+    const id = requiredText(messageId);
+    const body = editableText(value);
+    const space = await this.#ensureSpace();
+    const delivery = this.activeTurnId ? this.deliveryByTurn.get(this.activeTurnId) : null;
+    const progress = delivery?.progress?.message.id === id ? delivery.progress : null;
+    const message = progress?.message || await space.getMessage(id);
+    if (!message) throw new Error("message not found");
+    if (progress && progress.editCount >= PROGRESS_EDIT_LIMIT) {
+      throw new Error("four progress edits are already used; the fifth iMessage edit is reserved for the final answer");
+    }
+    return this.#editTextMessage(message, body, { phase: "control", progress });
+  }
+
+  async sendStack({ messages }) {
+    const bubbles = normalizeMessageStack(messages);
+    const space = await this.#ensureSpace();
+    const delivery = this.activeTurnId ? this.#deliveryRecord(this.activeTurnId) : null;
+    if (delivery) delivery.stackAttempted = true;
+    const results = [];
+    for (let index = 0; index < bubbles.length; index += 1) {
+      try {
+        const sent = requireProviderReceipt(await space.send(markdown(bubbles[index])), "stack message");
+        results.push({ index, sent: true, messageId: sent.id });
+      } catch (error) {
+        const safe = safeErrorRecord("stack_send_failed", error);
+        results.push({ index, sent: false, error: { category: safe.category, code: safe.code } });
+        for (let unsent = index + 1; unsent < bubbles.length; unsent += 1) {
+          results.push({ index: unsent, sent: false, notAttempted: true });
+        }
+        await this.logger("warn", "stack_send_failed", {
+          count: bubbles.length,
+          failedIndex: index,
+          sentCount: index,
+          errorCategory: safe.category,
+          errorCode: safe.code,
+        }, this.env);
+        return {
+          complete: false,
+          partial: index > 0,
+          sentCount: index,
+          total: bubbles.length,
+          firstUnsentIndex: index,
+          messages: results,
+          retryGuidance: "Send only bubbles at or after firstUnsentIndex; do not retry the whole stack.",
+        };
+      }
+    }
+    if (delivery) delivery.stackDelivered = true;
+    await this.logger("info", "stack_sent", { count: bubbles.length }, this.env);
+    return {
+      complete: true,
+      partial: false,
+      sentCount: bubbles.length,
+      total: bubbles.length,
+      firstUnsentIndex: null,
+      messages: results,
     };
   }
 
@@ -208,6 +292,7 @@ export class Bridge {
     try {
       await message.read().catch(() => {});
       await space.startTyping().catch(() => {});
+      if (this.activeTurnId) this.deliveryByTurn.delete(this.activeTurnId);
       if (!this.activeTurnId && this.messageQueue.length) {
         await this.#enqueueMessage(input, message, disposition.contentType);
         await this.#startQueuedTurn();
@@ -408,12 +493,30 @@ export class Bridge {
     const target = this.targetByTurn.get(turnId);
     const final = this.finalByTurn.get(turnId) || finalFromTurn(params.turn);
     let reactionState = this.reactionByTurn.get(turnId);
+    const delivery = this.deliveryByTurn.get(turnId);
     this.activeTurnId = null;
     this.targetByTurn.delete(turnId);
     this.finalByTurn.delete(turnId);
     await this.space?.stopTyping().catch(() => {});
     if (!target) {
       this.reactionByTurn.delete(turnId);
+      this.deliveryByTurn.delete(turnId);
+      await this.#startQueuedTurn();
+      return;
+    }
+    if (params.turn?.status === "completed" && delivery?.stackDelivered) {
+      if (final) {
+        const outbound = parseOutboundResponse(stripInternal(final));
+        if (outbound.reactionError) {
+          await this.logger("warn", "reaction_directive_invalid", { phase: "final_answer" }, this.env);
+        }
+        if (outbound.reaction && !reactionState) {
+          await this.#attemptReaction(turnId, target, outbound.reaction, "final_answer");
+        }
+      }
+      this.reactionByTurn.delete(turnId);
+      this.deliveryByTurn.delete(turnId);
+      await this.#recordReply(target.id);
       await this.#startQueuedTurn();
       return;
     }
@@ -425,6 +528,13 @@ export class Bridge {
       if (outbound.reaction && !reactionState) {
         reactionState = await this.#attemptReaction(turnId, target, outbound.reaction, "final_answer");
       }
+      if (outbound.text && await this.#finalizeProgress(turnId, outbound.text)) {
+        this.reactionByTurn.delete(turnId);
+        this.deliveryByTurn.delete(turnId);
+        await this.#recordReply(target.id);
+        await this.#startQueuedTurn();
+        return;
+      }
       const chunks = splitMessage(outbound.text);
       if (chunks.length) await target.reply(markdown(chunks[0]));
       for (const chunk of chunks.slice(1)) await target.space.send(markdown(chunk));
@@ -434,11 +544,13 @@ export class Bridge {
         await target.reply(text("I could not send that reaction."));
       }
       this.reactionByTurn.delete(turnId);
+      this.deliveryByTurn.delete(turnId);
       await this.#recordReply(target.id);
       await this.#startQueuedTurn();
       return;
     }
     this.reactionByTurn.delete(turnId);
+    this.deliveryByTurn.delete(turnId);
     await target.reply("I could not finish that Codex turn. Please try again.");
     await this.#recordReply(target.id);
     await this.#startQueuedTurn();
@@ -463,6 +575,74 @@ export class Bridge {
       }, this.env);
     }
     return state;
+  }
+
+  #deliveryRecord(turnId) {
+    let delivery = this.deliveryByTurn.get(turnId);
+    if (!delivery) {
+      delivery = { progress: null, hadFile: false, stackAttempted: false, stackDelivered: false };
+      this.deliveryByTurn.set(turnId, delivery);
+    }
+    return delivery;
+  }
+
+  async #editTextMessage(message, body, { phase, progress = null }) {
+    const timing = editableTiming(message);
+    const previous = progress?.text ?? plainMessageText(message.content);
+    if (previous === body) {
+      return {
+        edited: false,
+        unchanged: true,
+        targetMessageId: message.id,
+        editWindowEndsAt: timing.editWindowEndsAt,
+        observedEdits: progress?.editCount ?? null,
+        remainingProgressEdits: progress ? PROGRESS_EDIT_LIMIT - progress.editCount : null,
+        finalEditReserved: Boolean(progress),
+      };
+    }
+    try {
+      await message.edit(text(body));
+    } catch (error) {
+      const safe = safeErrorRecord("message_edit_failed", error);
+      await this.logger("warn", "message_edit_failed", {
+        phase,
+        errorCategory: safe.category,
+        errorCode: safe.code,
+      }, this.env);
+      throw error;
+    }
+    if (progress) {
+      progress.text = body;
+      progress.editCount += 1;
+    }
+    await this.logger("info", "message_edited", { phase }, this.env);
+    return {
+      edited: true,
+      unchanged: false,
+      targetMessageId: message.id,
+      editWindowEndsAt: timing.editWindowEndsAt,
+      observedEdits: progress?.editCount ?? null,
+      remainingProgressEdits: progress ? PROGRESS_EDIT_LIMIT - progress.editCount : null,
+      finalEditReserved: Boolean(progress),
+      ...(progress?.editCount === PROGRESS_EDIT_LIMIT ? {
+        warning: "Four progress edits are used. The fifth and final iMessage edit is reserved for completion.",
+      } : {}),
+      ...(!progress ? {
+        warning: "Apple allows at most five edits within 15 minutes. Earlier edits outside this bridge run are not observable.",
+      } : {}),
+    };
+  }
+
+  async #finalizeProgress(turnId, finalText) {
+    const delivery = this.deliveryByTurn.get(turnId);
+    const progress = delivery?.progress;
+    if (!progress || delivery.hadFile || delivery.stackAttempted || !isPlainTextFinal(finalText)) return false;
+    try {
+      await this.#editTextMessage(progress.message, finalText, { phase: "final_answer", progress });
+      return true;
+    } catch {
+      return false;
+    }
   }
 
   async #startControlServer() {
@@ -495,6 +675,9 @@ export class Bridge {
       const sent = await space.send(markdown(requiredText(request.text)));
       return { messageId: sent?.id || null };
     }
+    if (request.command === "send-stack") return this.sendStack(request);
+    if (request.command === "progress") return this.sendProgress(request);
+    if (request.command === "edit") return this.editMessage(request);
     if (request.command === "send-file") {
       return this.sendFile(request);
     }
@@ -679,6 +862,26 @@ export function normalizeMimeType(value) {
   return mimeType;
 }
 
+export function normalizeMessageStack(values) {
+  if (!Array.isArray(values) || values.length < 2) {
+    throw new Error("send-stack requires at least two message arguments");
+  }
+  if (values.length > STACK_MESSAGE_LIMIT) {
+    throw new Error(`send-stack accepts at most ${STACK_MESSAGE_LIMIT} messages`);
+  }
+  return values.map((value) => {
+    if (typeof value !== "string" || !value.trim()) throw new Error("every send-stack message must contain text");
+    return value;
+  });
+}
+
+export function isPlainTextFinal(value) {
+  const source = String(value || "").trim();
+  if (!source || source.length > EDIT_TEXT_LIMIT || splitMessage(source).length !== 1) return false;
+  const richMarkdown = /(^|\n)[ \t]{0,3}(?:#{1,6}[ \t]|>[ \t]|(?:[-+*]|\d+[.)])[ \t]|`{3,}|~{3,})|!\[[^\]]*\]\([^)]*\)|\[[^\]\n]+\]\([^)]*\)|\*\*|__|~~|`[^`\n]+`|(^|[^*])\*[^*\n]+\*(?!\*)|(^|[^_])_[^_\n]+_(?!_)/m;
+  return !richMarkdown.test(source);
+}
+
 export function splitMessage(text, limit = 4000) {
   const output = [];
   let rest = String(text || "").trim();
@@ -819,6 +1022,41 @@ function requireProviderReceipt(message, kind) {
     throw new Error("Photon reported that the attachment transfer failed");
   }
   return message;
+}
+
+function editableText(value) {
+  const body = requiredText(value);
+  if (body.length > EDIT_TEXT_LIMIT) {
+    throw new Error(`editable text exceeds ${EDIT_TEXT_LIMIT} characters; send it as a normal message instead`);
+  }
+  return body;
+}
+
+function editableTiming(message) {
+  if (message?.direction !== "outbound") throw new Error("only outbound messages can be edited");
+  if (!new Set(["text", "markdown"]).has(message.content?.type)) throw new Error("only outbound text messages can be edited");
+  const sentAt = message.timestamp instanceof Date ? message.timestamp.getTime() : Date.parse(message.timestamp);
+  if (!Number.isFinite(sentAt)) throw new Error("message send time is unavailable");
+  if (Date.now() - sentAt >= IMESSAGE_EDIT_WINDOW_MS) throw new Error("the 15-minute iMessage edit window has expired");
+  return { sentAt, editWindowEndsAt: new Date(sentAt + IMESSAGE_EDIT_WINDOW_MS).toISOString() };
+}
+
+function plainMessageText(content) {
+  if (content?.type === "text") return content.text;
+  if (content?.type === "markdown") return content.markdown;
+  return null;
+}
+
+function progressReceipt(progress) {
+  const timing = editableTiming(progress.message);
+  return {
+    providerAccepted: true,
+    messageId: progress.message.id,
+    editWindowEndsAt: timing.editWindowEndsAt,
+    observedEdits: progress.editCount,
+    remainingProgressEdits: PROGRESS_EDIT_LIMIT,
+    finalEditReserved: true,
+  };
 }
 
 function truncateUtf8(value, maxBytes) {
