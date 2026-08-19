@@ -7,9 +7,11 @@ const ERROR_EVENTS = new Set([
   "message_failed",
   "reaction_failed",
   "stack_send_failed",
+  "voice_send_failed",
+  "voice_transcription_failed",
 ]);
 
-const ERROR_CATEGORIES = new Set(["attachment", "codex", "control", "filesystem", "photon", "runtime"]);
+const ERROR_CATEGORIES = new Set(["attachment", "codex", "control", "filesystem", "photon", "runtime", "voice"]);
 const ERROR_CODES = new Set([
   "authentication",
   "configuration",
@@ -18,6 +20,7 @@ const ERROR_CODES = new Set([
   "not_found",
   "permission_denied",
   "provider_rejected",
+  "rate_limited",
   "size_limit",
   "timeout",
   "unavailable",
@@ -33,6 +36,8 @@ const EVENT_CATEGORIES = new Map([
   ["message_failed", "photon"],
   ["reaction_failed", "photon"],
   ["stack_send_failed", "photon"],
+  ["voice_send_failed", "voice"],
+  ["voice_transcription_failed", "voice"],
 ]);
 
 export function safeErrorRecord(event, error) {
@@ -65,13 +70,14 @@ function codeFor(error) {
   if (["ETIMEDOUT", "ESOCKETTIMEDOUT"].includes(systemCode)) return "timeout";
 
   const message = errorText(error);
-  if (/unauthori[sz]ed|authentication|credential|secret is missing/.test(message)) return "authentication";
+  if (/unauthori[sz]ed|authentication|credential|secret is missing|api key is missing/.test(message)) return "authentication";
+  if (/rate limit|too many requests/.test(message)) return "rate_limited";
   if (/timed? out|timeout/.test(message)) return "timeout";
   if (/exceeds|too large|size limit|body limit/.test(message)) return "size_limit";
   if (/not found|no .* found|could not be opened/.test(message)) return "not_found";
   if (/invalid|malformed|unexpected token|canonical base64|must be|is required|does not match|edit window|progress edits .* used/.test(message)) return "invalid_input";
   if (/config|missing|required|not configured/.test(message)) return "configuration";
-  if (/did not return|not sent|transfer failed|provider rejected|send error/.test(message)) return "provider_rejected";
+  if (/did not return|returned no text|invalid (?:audio|response)|not sent|transfer failed|provider rejected|was rejected|send error/.test(message)) return "provider_rejected";
   if (/not running|unavailable|exited|stream ended|cannot resume/.test(message)) return "unavailable";
   return "unexpected";
 }

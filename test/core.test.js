@@ -21,6 +21,7 @@ import {
   splitApprovalPrompt,
   splitMessage,
   transportInstructions,
+  voiceTranscript,
   withCompletionReminder,
 } from "../src/bridge.js";
 import {
@@ -39,6 +40,7 @@ import {
 import {
   DEFAULT_AUTO_SEND_FINAL,
   DEFAULT_CODEX_OVERRIDES,
+  DEFAULT_VOICE_CONFIG,
   emptyState,
   loadConfig,
   loadState,
@@ -46,6 +48,8 @@ import {
   normalizeCodexOverrides,
   normalizeSender,
   normalizeState,
+  normalizeVoiceConfig,
+  readElevenLabsApiKey,
   saveConfig,
   saveState,
 } from "../src/config.js";
@@ -53,6 +57,7 @@ import { safeErrorRecord } from "../src/errors.js";
 import { formatServerRequest, resolveServerRequest, supportsServerRequest } from "../src/interaction.js";
 import { logEvent } from "../src/log.js";
 import { launchAgentPlist } from "../src/service.js";
+import { VoiceService, elevenLabsSpeech, elevenLabsTranscribe } from "../src/voice.js";
 
 const TEST_SENDER = `+${"9".repeat(11)}`;
 
@@ -84,7 +89,7 @@ test("persists the final-delivery setting with transport configuration and the t
 
     const stored = JSON.parse(await readFile(path.join(home, "config.json"), "utf8"));
     const loaded = await loadConfig(env);
-    assert.deepEqual(Object.keys(stored).sort(), ["allowedSender", "autoSendFinal", "codexOverrides", "cwd", "maxAttachmentBytes", "projectId"]);
+    assert.deepEqual(Object.keys(stored).sort(), ["allowedSender", "autoSendFinal", "codexOverrides", "cwd", "maxAttachmentBytes", "projectId", "voice"]);
     assert.equal(stored.autoSendFinal, true);
     assert.equal(loaded.autoSendFinal, true);
     assert.deepEqual(stored.codexOverrides, {
@@ -97,6 +102,8 @@ test("persists the final-delivery setting with transport configuration and the t
       fastMode: false,
       followUpMode: "steer",
     });
+    assert.deepEqual(loaded.voice, DEFAULT_VOICE_CONFIG);
+    assert.equal(stored.voice.elevenlabs.ttsModel, "Eleven v3");
   } finally {
     await rm(home, { recursive: true, force: true });
   }
@@ -115,9 +122,10 @@ test("ignores legacy Codex overrides in Photon config", async () => {
     }));
 
     const loaded = await loadConfig(env);
-    assert.deepEqual(Object.keys(loaded).sort(), ["allowedSender", "autoSendFinal", "codexOverrides", "cwd", "maxAttachmentBytes", "projectId"]);
+    assert.deepEqual(Object.keys(loaded).sort(), ["allowedSender", "autoSendFinal", "codexOverrides", "cwd", "maxAttachmentBytes", "projectId", "voice"]);
     assert.equal(loaded.autoSendFinal, false);
     assert.deepEqual(loaded.codexOverrides, {});
+    assert.deepEqual(loaded.voice, DEFAULT_VOICE_CONFIG);
   } finally {
     await rm(home, { recursive: true, force: true });
   }
@@ -173,11 +181,280 @@ test("normalizes the complete public override vocabulary and validates the bound
   assert.throws(() => normalizeCodexOverrides([]), /must be an object/);
 });
 
+test("normalizes the focused voice configuration and rejects unsupported settings", () => {
+  assert.deepEqual(normalizeVoiceConfig(), DEFAULT_VOICE_CONFIG);
+  assert.deepEqual(normalizeVoiceConfig({
+    ttsEngine: "MSD",
+    elevenlabs: { ttsModel: "Eleven Flash v2.5" },
+    msd: { voice: "alloy" },
+  }), {
+    ttsEngine: "msd",
+    elevenlabs: {
+      sttModel: "scribe_v2",
+      ttsModel: "eleven_flash_v2_5",
+      voiceId: "FSZ4QLofSALZxepAyq63",
+      stability: 0.5,
+      similarityBoost: 0.75,
+      speed: 1,
+    },
+    msd: { voice: "alloy" },
+  });
+  assert.equal(readElevenLabsApiKey({ ELEVENLABS_API_KEY: "test-key" }), "test-key");
+  assert.throws(() => normalizeVoiceConfig({ ttsEngine: "other" }), /elevenlabs or msd/);
+  assert.throws(() => normalizeVoiceConfig({ sttEngine: "macparakeet" }), /unsupported field: sttEngine/);
+  assert.throws(() => normalizeVoiceConfig({ elevenlabs: { sttModel: "scribe_v1" } }), /must be scribe_v2/);
+  assert.throws(() => normalizeVoiceConfig({ elevenlabs: { ttsModel: "turbo" } }), /Eleven v3 or Eleven Flash v2.5/);
+  assert.throws(() => normalizeVoiceConfig({ elevenlabs: { voiceId: "voice id" } }), /valid voice ID/);
+  assert.throws(() => normalizeVoiceConfig({ elevenlabs: { stability: 2 } }), /number from 0 to 1/);
+  assert.throws(() => normalizeVoiceConfig({ elevenlabs: { similarityBoost: "0.75" } }), /number from 0 to 1/);
+  assert.throws(() => normalizeVoiceConfig({ elevenlabs: { speed: 1.3 } }), /number from 0.7 to 1.2/);
+  assert.throws(() => normalizeVoiceConfig({ msd: { model: "forbidden" } }), /unsupported field: model/);
+  assert.throws(() => normalizeVoiceConfig({ providerRegistry: {} }), /unsupported field: providerRegistry/);
+});
+
+test("uses the exact Scribe v2 request without persisting timestamp detail", async () => {
+  const audio = Buffer.from("test voice bytes");
+  let request;
+  const transcript = await elevenLabsTranscribe({
+    apiKey: "private-test-key",
+    bytes: audio,
+    mimeType: "audio/mpeg",
+    name: "voice.mp3",
+    fetchImpl: async (url, options) => {
+      request = { url, options };
+      return new Response(JSON.stringify({ text: "  names may be imperfect  ", words: [{ text: "private" }] }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      });
+    },
+  });
+
+  assert.equal(transcript, "names may be imperfect");
+  assert.equal(request.url, "https://api.elevenlabs.io/v1/speech-to-text");
+  assert.equal(request.options.headers["xi-api-key"], "private-test-key");
+  assert.deepEqual(Object.fromEntries([
+    "model_id", "timestamps_granularity", "tag_audio_events", "diarize", "no_verbatim", "use_multi_channel", "webhook",
+  ].map((name) => [name, request.options.body.get(name)])), {
+    model_id: "scribe_v2",
+    timestamps_granularity: "none",
+    tag_audio_events: "true",
+    diarize: "false",
+    no_verbatim: "false",
+    use_multi_channel: "false",
+    webhook: "false",
+  });
+  assert.equal(Buffer.from(await request.options.body.get("file").arrayBuffer()).compare(audio), 0);
+});
+
+test("normalizes native iMessage CAF audio before Scribe without retaining the source", async () => {
+  const source = Buffer.from("native caf bytes");
+  const m4a = Buffer.concat([Buffer.from([0, 0, 0, 20]), Buffer.from("ftypM4A "), Buffer.from("converted")]);
+  let uploaded;
+  const service = new VoiceService({
+    config: { ...DEFAULT_VOICE_CONFIG, maxAttachmentBytes: 1024 },
+    env: {
+      PATH: "/usr/bin",
+      PHOTON_PROJECT_SECRET: "photon-secret",
+      ELEVENLABS_API_KEY: "private-test-key",
+    },
+    platform: "darwin",
+    execFileImpl: async (command, args, options) => {
+      assert.equal(command, "/usr/bin/afconvert");
+      assert.equal(options.env.PATH, "/usr/bin");
+      assert.equal(options.env.PHOTON_PROJECT_SECRET, undefined);
+      assert.equal(options.env.ELEVENLABS_API_KEY, undefined);
+      assert.equal((await readFile(args.at(-2))).compare(source), 0);
+      await writeFile(args.at(-1), m4a);
+    },
+    fetchImpl: async (_url, options) => {
+      const file = options.body.get("file");
+      uploaded = { type: file.type, name: file.name, bytes: Buffer.from(await file.arrayBuffer()) };
+      return new Response(JSON.stringify({ text: "clear transcript" }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      });
+    },
+  });
+
+  const transcript = await service.transcribe({
+    mimeType: "audio/x-caf",
+    size: source.byteLength,
+    read: async () => source,
+  }, 1024);
+
+  assert.equal(transcript, "clear transcript");
+  assert.equal(uploaded.type, "audio/mp4");
+  assert.equal(uploaded.name, "voice.m4a");
+  assert.equal(uploaded.bytes.compare(m4a), 0);
+});
+
+test("cancels a stalled inbound voice stream on a bounded timeout", async () => {
+  let cancelled = 0;
+  let requested = false;
+  const iterator = {
+    next: async () => await new Promise(() => {}),
+    return: async () => { cancelled += 1; return { done: true }; },
+  };
+  const service = new VoiceService({
+    config: { ...DEFAULT_VOICE_CONFIG, maxAttachmentBytes: 1024 },
+    env: { ELEVENLABS_API_KEY: "private-test-key" },
+    streamIdleTimeoutMs: 5,
+    streamOverallTimeoutMs: 20,
+    fetchImpl: async () => { requested = true; throw new Error("must not upload"); },
+  });
+
+  await assert.rejects(() => service.transcribe({
+    mimeType: "audio/x-caf",
+    stream: async () => ({ [Symbol.asyncIterator]: () => iterator }),
+  }, 1024), /voice message read timed out/);
+  assert.equal(cancelled, 1);
+  assert.equal(requested, false);
+});
+
+test("preserves ElevenLabs delivery tags and restricts speech models", async () => {
+  const source = Buffer.from("synthetic mp3 bytes");
+  let request;
+  const result = await elevenLabsSpeech({
+    apiKey: "private-test-key",
+    text: "[laughs softly] That worked",
+    model: "eleven_v3",
+    voiceId: "voice_ID-1",
+    voiceSettings: { stability: 0.5, similarity_boost: 0.75, speed: 1 },
+    maxBytes: 1024,
+    fetchImpl: async (url, options) => {
+      request = { url, options };
+      return new Response(source, { status: 200, headers: { "content-type": "audio/mpeg" } });
+    },
+  });
+
+  assert.equal(request.url, "https://api.elevenlabs.io/v1/text-to-speech/voice_ID-1?output_format=mp3_44100_128");
+  assert.deepEqual(JSON.parse(request.options.body), {
+    text: "[laughs softly] That worked",
+    model_id: "eleven_v3",
+    voice_settings: { stability: 0.5, similarity_boost: 0.75, speed: 1 },
+  });
+  assert.equal(request.options.headers["xi-api-key"], "private-test-key");
+  assert.equal(result.mimeType, "audio/mpeg");
+  assert.equal(result.bytes.compare(source), 0);
+
+  const m4a = Buffer.concat([Buffer.from([0, 0, 0, 20]), Buffer.from("ftypM4A "), Buffer.from("voice")]);
+  const modelRequests = [];
+  const fetchImpl = async (_url, options) => {
+    modelRequests.push(JSON.parse(options.body));
+    return new Response(m4a, { status: 200, headers: { "content-type": "audio/mp4" } });
+  };
+  const v3 = new VoiceService({
+    config: { ...DEFAULT_VOICE_CONFIG, maxAttachmentBytes: 1024 },
+    env: { ELEVENLABS_API_KEY: "private-test-key" },
+    fetchImpl,
+  });
+  const flash = new VoiceService({
+    config: {
+      ...DEFAULT_VOICE_CONFIG,
+      elevenlabs: { ...DEFAULT_VOICE_CONFIG.elevenlabs, ttsModel: "eleven_flash_v2_5", speed: 0.9 },
+      maxAttachmentBytes: 1024,
+    },
+    env: { ELEVENLABS_API_KEY: "private-test-key" },
+    fetchImpl,
+  });
+  await v3.synthesize("Natural v3 delivery");
+  await flash.synthesize("Fast delivery");
+  assert.deepEqual(modelRequests.map(({ model_id, voice_settings }) => ({ model_id, voice_settings })), [
+    { model_id: "eleven_v3", voice_settings: { stability: 0.5 } },
+    {
+      model_id: "eleven_flash_v2_5",
+      voice_settings: { stability: 0.5, similarity_boost: 0.75, speed: 0.9 },
+    },
+  ]);
+
+  await assert.rejects(() => elevenLabsSpeech({
+    apiKey: "private-test-key",
+    text: "hello",
+    model: "eleven_v3",
+    voiceId: "voice",
+    maxBytes: 1024,
+    fetchImpl: async () => new Response("private provider diagnostic", { status: 400 }),
+  }), (error) => {
+    assert.equal(error.message, "ElevenLabs speech synthesis was rejected");
+    return true;
+  });
+});
+
+test("passes MSD text through a private file and forwards only voice and instruct selectors", async () => {
+  const calls = [];
+  const m4a = Buffer.concat([Buffer.from([0, 0, 0, 20]), Buffer.from("ftypM4A "), Buffer.from("converted")]);
+  const service = new VoiceService({
+    config: {
+      ...DEFAULT_VOICE_CONFIG,
+      ttsEngine: "msd",
+      msd: { voice: "speaker-1" },
+      maxAttachmentBytes: 1024,
+    },
+    env: { PATH: "/usr/bin", PHOTON_PROJECT_SECRET: "secret", ELEVENLABS_API_KEY: "voice-secret" },
+    platform: "darwin",
+    execFileImpl: async (command, args, options) => {
+      calls.push({ command, args: [...args] });
+      assert.equal(options.env.PATH, "/usr/bin");
+      assert.equal(options.env.PHOTON_PROJECT_SECRET, undefined);
+      assert.equal(options.env.ELEVENLABS_API_KEY, undefined);
+      if (command === "msd") {
+        assert.equal(await readFile(args[args.indexOf("--input") + 1], "utf8"), "A private spoken answer");
+        await writeFile(args[args.indexOf("--output") + 1], "wave bytes");
+        return;
+      }
+      assert.equal(command, "/usr/bin/afconvert");
+      await writeFile(args.at(-1), m4a);
+    },
+  });
+
+  const result = await service.synthesize("A private spoken answer", "warm and concise");
+
+  assert.equal(result.bytes.compare(m4a), 0);
+  assert.equal(result.mimeType, "audio/mp4");
+  assert.equal(result.engine, "msd");
+  assert.equal(result.model, null);
+  assert.equal(calls[0].args.includes("--model"), false);
+  assert.deepEqual(calls[0].args.slice(calls[0].args.indexOf("--voice")), [
+    "--voice", "speaker-1", "--instruct", "warm and concise",
+  ]);
+  assert.equal(calls[0].args.includes("A private spoken answer"), false);
+});
+
+test("uses a credential-free ffmpeg child and preserves conversion size errors", async () => {
+  const service = new VoiceService({
+    config: {
+      ...DEFAULT_VOICE_CONFIG,
+      ttsEngine: "msd",
+      maxAttachmentBytes: 64,
+    },
+    env: { PATH: "/usr/bin", PHOTON_PROJECT_SECRET: "secret", ELEVENLABS_API_KEY: "voice-secret" },
+    platform: "linux",
+    execFileImpl: async (command, args, options) => {
+      assert.equal(options.env.PHOTON_PROJECT_SECRET, undefined);
+      assert.equal(options.env.ELEVENLABS_API_KEY, undefined);
+      if (command === "msd") {
+        await writeFile(args[args.indexOf("--output") + 1], "wave");
+        return;
+      }
+      assert.equal(command, "ffmpeg");
+      assert.deepEqual(args.slice(0, 7), ["-nostdin", "-y", "-i", args[3], "-f", "ipod", "-c:a"]);
+      await writeFile(args.at(-1), Buffer.concat([
+        Buffer.from([0, 0, 0, 20]), Buffer.from("ftypM4A "), Buffer.alloc(80),
+      ]));
+    },
+  });
+
+  await assert.rejects(() => service.synthesize("bounded output"), /voice audio exceeds 64 bytes/);
+});
+
 test("makes manual final delivery the explicit default transport contract", () => {
   const manual = transportInstructions(false);
   assert.match(manual, /Automatic final delivery is disabled/);
   assert.match(manual, /No final answer, commentary, reasoning summary, tool call, tool output, or reaction directive/);
   assert.match(manual, /end the Codex turn with exactly Answered/);
+  assert.match(manual, /received voice note is transcribed and labeled/i);
+  assert.match(manual, /photon-codex send-voice/);
+  assert.match(manual, /photon-codex react current/);
   assert.match(manual, /Automatic progress-to-final editing is disabled/);
 
   const automatic = transportInstructions(true);
@@ -374,6 +651,72 @@ test("snapshots and fingerprints an outbound file before Spectrum reads it", asy
   }
 });
 
+test("sends synthesized bytes as a native voice message and returns the provider receipt", async () => {
+  const audio = Buffer.concat([Buffer.from([0, 0, 0, 20]), Buffer.from("ftypM4A "), Buffer.from("voice bytes")]);
+  const events = [];
+  let built;
+  const bridge = new Bridge({
+    config: { projectId: "project", allowedSender: TEST_SENDER, cwd: "/tmp", maxAttachmentBytes: 1024 },
+    projectSecret: "secret",
+    voiceService: {
+      synthesize: async (text, instruct) => {
+        assert.equal(text, "[laughs] shipped");
+        assert.equal(instruct, null);
+        return { bytes: audio, mimeType: "audio/mp4", engine: "elevenlabs", model: "eleven_v3" };
+      },
+    },
+    logger: async (level, event, details) => events.push({ level, event, details }),
+  });
+  bridge.state = { ...emptyState(), spaceId: "space-1" };
+  bridge.space = {
+    id: "space-1",
+    send: async (builder) => {
+      built = await builder.build();
+      return {
+        id: "voice-message-1",
+        isSent: true,
+        isDelivered: false,
+        attachmentMetadata: [{ mimeType: "audio/mp4", totalBytes: audio.byteLength, transferState: "finished" }],
+      };
+    },
+  };
+
+  const receipt = await bridge.sendVoice({ text: "[laughs] shipped" });
+
+  assert.equal(built.type, "voice");
+  assert.equal(built.name, "voice.m4a");
+  assert.equal(built.mimeType, "audio/mp4");
+  assert.equal((await built.read()).compare(audio), 0);
+  assert.deepEqual(receipt, {
+    providerAccepted: true,
+    messageId: "voice-message-1",
+    engine: "elevenlabs",
+    model: "eleven_v3",
+    size: audio.byteLength,
+    providerMimeType: "audio/mp4",
+    providerSize: audio.byteLength,
+    isSent: true,
+    isDelivered: false,
+    transferState: "finished",
+  });
+  assert.deepEqual(events, [{
+    level: "info",
+    event: "voice_sent",
+    details: { engine: "elevenlabs", size: audio.byteLength, providerDelivered: false },
+  }]);
+
+  let synthesized = 0;
+  const unbound = new Bridge({
+    config: { projectId: "project", allowedSender: TEST_SENDER, cwd: "/tmp", maxAttachmentBytes: 1024 },
+    projectSecret: "secret",
+    voiceService: { synthesize: async () => { synthesized += 1; } },
+    logger: async () => {},
+  });
+  unbound.state = emptyState();
+  await assert.rejects(() => unbound.sendVoice({ text: "must not consume quota" }), /conversation is bound/i);
+  assert.equal(synthesized, 0);
+});
+
 test("fails outbound files closed on size and missing provider receipts", async () => {
   const home = await mkdtemp(path.join(os.tmpdir(), "photon-codex-send-file-fail-"));
   let sends = 0;
@@ -529,7 +872,7 @@ test("authenticates the bounded control preface before accepting a framed attach
   }
 });
 
-test("carries edit, progress, and message-stack commands through the bounded control protocol", async () => {
+test("carries edit, progress, stack, and voice commands through the bounded control protocol", async () => {
   const token = "test-message-control-token";
   const received = [];
   const server = await startControlServer({
@@ -557,7 +900,13 @@ test("carries edit, progress, and message-stack commands through the bounded con
       command: "send-stack",
       body: { messages: ["one", "two\nlines", "😀"] },
     }), { command: "send-stack" });
-    assert.deepEqual(received.map(({ command }) => command), ["progress", "edit", "send-stack"]);
+    assert.deepEqual(await controlRequest({
+      port,
+      token,
+      command: "send-voice",
+      body: { text: "[laughs] shipped", instruct: null },
+    }), { command: "send-voice" });
+    assert.deepEqual(received.map(({ command }) => command), ["progress", "edit", "send-stack", "send-voice"]);
   } finally {
     server.destroyControlConnections();
     await new Promise((resolve) => server.close(resolve));
@@ -600,6 +949,19 @@ test("persists only allowlisted content-free log and last-error fields", async (
       errorCode: "provider_rejected",
       ...hostile,
     }, env);
+    await logEvent("warn", "voice_transcription_failed", {
+      engine: "elevenlabs",
+      errorCategory: "voice",
+      errorCode: "authentication",
+      ...hostile,
+    }, env);
+    await logEvent("warn", "voice_send_failed", {
+      engine: "msd",
+      stage: "synthesis",
+      errorCategory: "voice",
+      errorCode: "unavailable",
+      ...hostile,
+    }, env);
 
     const state = emptyState();
     state.runtime.lastError = { ...safe, detail: Object.values(hostile).join(" | ") };
@@ -615,10 +977,22 @@ test("persists only allowlisted content-free log and last-error fields", async (
     assert.equal(entries[1].event, "log_event_rejected");
     assert.deepEqual(Object.keys(entries[2]).sort(), ["errorCategory", "errorCode", "event", "level", "phase", "time"]);
     assert.deepEqual(Object.keys(entries[3]).sort(), ["count", "errorCategory", "errorCode", "event", "failedIndex", "level", "sentCount", "time"]);
+    assert.deepEqual(Object.keys(entries[4]).sort(), ["engine", "errorCategory", "errorCode", "event", "level", "time"]);
+    assert.deepEqual(Object.keys(entries[5]).sort(), ["engine", "errorCategory", "errorCode", "event", "level", "stage", "time"]);
     assert.deepEqual((await loadState(env)).runtime.lastError, safe);
   } finally {
     await rm(home, { recursive: true, force: true });
   }
+});
+
+test("classifies voice authentication, limits, and provider failures without retaining details", () => {
+  assert.deepEqual(safeErrorRecord("voice_send_failed", new Error("ElevenLabs API key is missing")), {
+    event: "voice_send_failed",
+    category: "voice",
+    code: "authentication",
+  });
+  assert.equal(safeErrorRecord("voice_transcription_failed", new Error("voice message exceeds 10 bytes")).code, "size_limit");
+  assert.equal(safeErrorRecord("voice_send_failed", new Error("ElevenLabs speech synthesis was rejected")).code, "provider_rejected");
 });
 
 test("normalizes aliases and requires a provider receipt for direct reactions", async () => {
@@ -640,6 +1014,18 @@ test("normalizes aliases and requires a provider receipt for direct reactions", 
     emoji: "👍",
   });
   assert.deepEqual(seen, ["👍"]);
+  bridge.activeTurnId = "turn-1";
+  bridge.targetByTurn.set("turn-1", {
+    id: "latest-inbound",
+    react: async (emoji) => { seen.push(emoji); return { id: "reaction-current" }; },
+  });
+  assert.deepEqual(await bridge.reactToMessage({ messageId: "current", emoji: "question" }), {
+    providerAccepted: true,
+    targetMessageId: "latest-inbound",
+    receiptId: "reaction-current",
+    emoji: "❓",
+  });
+  assert.deepEqual(seen, ["👍", "❓"]);
   bridge.space.getMessage = async () => ({ react: async () => undefined });
   await assert.rejects(
     () => bridge.reactToMessage({ messageId: "message-1", emoji: "👍" }),
@@ -1047,6 +1433,52 @@ test("a complete stack remains the delivered answer when Codex emits no final te
   }
 });
 
+test("a successful voice note remains the delivered answer in automatic mode", async () => {
+  const home = await mkdtemp(path.join(os.tmpdir(), "photon-codex-voice-final-"));
+  const replies = [];
+  try {
+    const audio = Buffer.concat([Buffer.from([0, 0, 0, 20]), Buffer.from("ftypM4A "), Buffer.from("voice")]);
+    const space = {
+      id: "space-1",
+      send: async () => ({
+        id: "voice-final",
+        isSent: true,
+        attachmentMetadata: [{ mimeType: "audio/mp4", totalBytes: audio.byteLength, transferState: "finished" }],
+      }),
+      stopTyping: async () => {},
+    };
+    const bridge = new Bridge({
+      config: { projectId: "project", allowedSender: TEST_SENDER, cwd: home, maxAttachmentBytes: 1024, autoSendFinal: true },
+      projectSecret: "secret",
+      env: { ...process.env, PHOTON_CODEX_HOME: home },
+      voiceService: {
+        synthesize: async () => ({ bytes: audio, mimeType: "audio/mp4", engine: "elevenlabs", model: "eleven_v3" }),
+      },
+      logger: async () => {},
+    });
+    bridge.state = { ...emptyState(), spaceId: "space-1" };
+    bridge.space = space;
+    bridge.activeTurnId = "turn-voice";
+    bridge.targetByTurn.set("turn-voice", {
+      id: "inbound-voice",
+      reply: async (content) => { replies.push(content); },
+      space,
+    });
+
+    await bridge.sendVoice({ text: "Spoken answer" });
+    bridge.finalByTurn.set("turn-voice", "Answered.");
+    await bridge.handleCodexNotification("turn/completed", {
+      turn: { id: "turn-voice", status: "completed", items: [] },
+    });
+
+    assert.deepEqual(replies, []);
+    assert.deepEqual(bridge.state.repliedMessageIds, ["inbound-voice"]);
+    assert.equal(bridge.deliveryByTurn.size, 0);
+  } finally {
+    await rm(home, { recursive: true, force: true });
+  }
+});
+
 test("reports stack partial delivery exactly and never retries a sent bubble", async () => {
   const home = await mkdtemp(path.join(os.tmpdir(), "photon-codex-stack-partial-"));
   const attempts = [];
@@ -1205,6 +1637,118 @@ test("accepts one user message and records one successful reply", async () => {
     assert.deepEqual(bridge.state.repliedMessageIds, ["message-1"]);
     assert.equal(bridge.state.runtime.acceptedMessages, 1);
     assert.equal(bridge.state.runtime.repliesSent, 1);
+  } finally {
+    await rm(home, { recursive: true, force: true });
+  }
+});
+
+test("forwards only a labeled voice transcript into the persistent Codex thread", async () => {
+  const home = await mkdtemp(path.join(os.tmpdir(), "photon-codex-voice-inbound-"));
+  const inputs = [];
+  const events = [];
+  try {
+    const bridge = new Bridge({
+      config: { projectId: "project", allowedSender: TEST_SENDER, cwd: home, maxAttachmentBytes: 1024 },
+      projectSecret: "secret",
+      env: { ...process.env, PHOTON_CODEX_HOME: home },
+      voiceService: {
+        transcribe: async (content, maxBytes) => {
+          assert.equal(content.mimeType, "audio/x-caf");
+          assert.equal(maxBytes, 1024);
+          return "Open the Photon project and check Scribe";
+        },
+      },
+      logger: async (level, event, details) => events.push({ level, event, details }),
+    });
+    bridge.state = { ...emptyState(), spaceId: "space-1" };
+    bridge.codex = {
+      startTurn: async (input) => {
+        inputs.push(input);
+        return { turn: { id: "voice-turn" } };
+      },
+    };
+    const space = { id: "space-1", type: "dm", startTyping: async () => {}, stopTyping: async () => {} };
+    bridge.space = space;
+    await bridge.handleMessage(space, {
+      id: "voice-inbound-1",
+      direction: "inbound",
+      sender: { id: TEST_SENDER },
+      content: { type: "voice", name: "Audio Message.caf", mimeType: "audio/x-caf", size: 17 },
+      read: async () => {},
+      space,
+    });
+
+    assert.deepEqual(inputs, [[{
+      type: "text",
+      text: voiceTranscript("Open the Photon project and check Scribe"),
+      text_elements: [],
+    }]]);
+    assert.deepEqual(bridge.state.acceptedMessageIds, ["voice-inbound-1"]);
+    assert.deepEqual(events.filter(({ event }) => event === "voice_transcribed"), [{
+      level: "info",
+      event: "voice_transcribed",
+      details: { engine: "elevenlabs" },
+    }]);
+  } finally {
+    await rm(home, { recursive: true, force: true });
+  }
+});
+
+test("a transcription failure is visible, safe, and cannot stop the next text turn", async () => {
+  const home = await mkdtemp(path.join(os.tmpdir(), "photon-codex-voice-recovery-"));
+  const replies = [];
+  const starts = [];
+  const events = [];
+  try {
+    const bridge = new Bridge({
+      config: { projectId: "project", allowedSender: TEST_SENDER, cwd: home, maxAttachmentBytes: 1024 },
+      projectSecret: "secret",
+      env: { ...process.env, PHOTON_CODEX_HOME: home },
+      voiceService: { transcribe: async () => { throw new Error("private provider response with credential and path"); } },
+      logger: async (level, event, details) => events.push({ level, event, details }),
+    });
+    bridge.state = { ...emptyState(), spaceId: "space-1" };
+    bridge.codex = {
+      startTurn: async (input) => {
+        starts.push(input);
+        return { turn: { id: "recovered-turn" } };
+      },
+    };
+    const space = { id: "space-1", type: "dm", startTyping: async () => {}, stopTyping: async () => {} };
+    bridge.space = space;
+    const common = { direction: "inbound", sender: { id: TEST_SENDER }, read: async () => {}, space };
+
+    await bridge.handleMessage(space, {
+      ...common,
+      id: "unnoticed-voice",
+      content: { type: "voice", name: "Audio Message.caf", mimeType: "audio/x-caf", size: 17 },
+      reply: async () => undefined,
+    });
+    assert.deepEqual(bridge.state.acceptedMessageIds, []);
+
+    await bridge.handleMessage(space, {
+      ...common,
+      id: "failed-voice",
+      content: {
+        type: "reply",
+        target: { id: "earlier-message" },
+        content: { type: "voice", name: "Audio Message.caf", mimeType: "audio/x-caf", size: 17 },
+      },
+      reply: async (text) => { replies.push(text); return { id: "failure-notice" }; },
+    });
+    await bridge.handleMessage(space, {
+      ...common,
+      id: "next-text",
+      content: { type: "text", text: "continue in text" },
+    });
+
+    assert.deepEqual(replies, ["I could not transcribe that voice message. Please resend it or type the request."]);
+    assert.equal(starts.length, 1);
+    assert.equal(starts[0][0].text, "continue in text");
+    assert.deepEqual(bridge.state.acceptedMessageIds, ["failed-voice", "next-text"]);
+    assert.equal(bridge.state.runtime.lastError?.event, "voice_transcription_failed");
+    assert.equal(JSON.stringify(events).includes("private provider response"), false);
+    assert.equal(events.some(({ event }) => event === "voice_transcription_failed"), true);
   } finally {
     await rm(home, { recursive: true, force: true });
   }
@@ -1403,6 +1947,70 @@ test("never applies a late threaded answer to the current Codex prompt", async (
     assert.equal(responses, 0);
     assert.equal(bridge.pendingRequests.length, 1);
     assert.equal(replies.length, 1);
+  } finally {
+    await rm(home, { recursive: true, force: true });
+  }
+});
+
+test("transcribes safe Codex input prompts but keeps approval decisions text-only", async () => {
+  const home = await mkdtemp(path.join(os.tmpdir(), "photon-codex-voice-input-"));
+  const responses = [];
+  const notices = [];
+  let transcriptions = 0;
+  try {
+    const bridge = new Bridge({
+      config: { projectId: "project", allowedSender: TEST_SENDER, cwd: home, maxAttachmentBytes: 1024 },
+      projectSecret: "secret",
+      env: { ...process.env, PHOTON_CODEX_HOME: home },
+      voiceService: { transcribe: async () => { transcriptions += 1; return "2"; } },
+      logger: async () => {},
+    });
+    bridge.state = { ...emptyState(), spaceId: "space-1" };
+    bridge.codex = { respond: (id, result) => responses.push({ id, result }) };
+    bridge.pendingRequests = [{
+      id: 1,
+      method: "item/tool/requestUserInput",
+      params: {
+        questions: [{
+          id: "mode",
+          question: "Choose mode",
+          isOther: false,
+          options: [{ label: "Safe" }, { label: "Fast" }],
+        }],
+      },
+      promptIds: [],
+      requiresThreadedReply: false,
+    }];
+    const space = { id: "space-1", type: "dm" };
+    const message = (id) => ({
+      id,
+      direction: "inbound",
+      sender: { id: TEST_SENDER },
+      content: { type: "voice", name: "Audio Message.caf", mimeType: "audio/x-caf", size: 17 },
+      read: async () => {},
+      react: async () => ({ id: "ack" }),
+      reply: async (value) => { notices.push(value); return { id: "notice" }; },
+      space,
+    });
+
+    await bridge.handleMessage(space, message("voice-input"));
+    assert.deepEqual(responses, [{
+      id: 1,
+      result: { answers: { mode: { answers: ["Fast"] } } },
+    }]);
+    assert.equal(transcriptions, 1);
+
+    bridge.pendingRequests = [{
+      id: 2,
+      method: "item/commandExecution/requestApproval",
+      params: { command: "exact-command" },
+      promptIds: [],
+      requiresThreadedReply: false,
+    }];
+    await bridge.handleMessage(space, message("voice-approval"));
+    assert.equal(transcriptions, 1);
+    assert.equal(responses.length, 1);
+    assert.equal(notices.at(-1), "Please answer the pending Codex prompt with text.");
   } finally {
     await rm(home, { recursive: true, force: true });
   }
@@ -2171,6 +2779,7 @@ test("removes Photon credentials but preserves the non-secret control home", () 
     CODEX_HOME: "/tmp/codex-home",
     PHOTON_PROJECT_SECRET: "secret",
     PHOTON_CODEX_HOME: "/tmp/photon-home",
+    ELEVENLABS_API_KEY: "voice-secret",
   }), {
     PATH: "/usr/bin",
     CODEX_HOME: "/tmp/codex-home",

@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 
 import { spawnSync } from "node:child_process";
+import { existsSync } from "node:fs";
 import { mkdir, readFile } from "node:fs/promises";
 import path from "node:path";
 import { createInterface } from "node:readline/promises";
@@ -11,14 +12,18 @@ import { CodexAppServer, codexExecutable, codexHome } from "./codex.js";
 import {
   DEFAULT_AUTO_SEND_FINAL,
   DEFAULT_CODEX_OVERRIDES,
+  DEFAULT_VOICE_CONFIG,
+  credentialFreeEnvironment,
   loadConfig,
   loadState,
   readProjectSecret,
+  readElevenLabsApiKey,
   redactConfig,
   runtimeLogPath,
   saveConfig,
   saveState,
   setProjectSecret,
+  setElevenLabsApiKey,
   workspacePath,
 } from "./config.js";
 import { logEvent } from "./log.js";
@@ -36,13 +41,14 @@ const [command = "help", ...args] = process.argv.slice(2);
 
 try {
   if (command === "init") await init(args);
-  else if (command === "auth" && args[0] === "set") await authSet();
+  else if (command === "auth" && args[0] === "set") await authSet(args[1]);
   else if (command === "run") await run();
   else if (command === "doctor") await doctor();
   else if (command === "status") print({ ...(await statusResult()), service: serviceStatus() });
   else if (command === "stop") print(await control("stop"));
   else if (command === "send") print(await control("send", { text: args.join(" ") }));
   else if (command === "send-stack") await sendStack(args);
+  else if (command === "send-voice") await sendVoice(args);
   else if (command === "progress") print(await control("progress", { text: args.join(" ") }));
   else if (command === "edit") print(await control("edit", { messageId: args[0], text: args.slice(1).join(" ") }));
   else if (command === "send-file") await sendFile(args);
@@ -84,19 +90,30 @@ async function init(args) {
       cwd: path.resolve(cwd),
       autoSendFinal: DEFAULT_AUTO_SEND_FINAL,
       codexOverrides: DEFAULT_CODEX_OVERRIDES,
+      voice: DEFAULT_VOICE_CONFIG,
     });
     print({ configured: true, config: redactConfig(config) });
-    if (process.platform === "darwin") stdout.write("Next: photon-codex auth set\n");
+    if (process.platform === "darwin") stdout.write("Next: photon-codex auth set\nOptional voice: photon-codex auth set elevenlabs\n");
     else stdout.write("Next: set PHOTON_PROJECT_SECRET, then run photon-codex doctor\n");
   } finally {
     rl.close();
   }
 }
 
-async function authSet() {
-  const config = await loadConfig();
-  setProjectSecret(config.projectId);
-  stdout.write("Photon secret saved in macOS Keychain.\n");
+async function authSet(providerValue) {
+  const provider = String(providerValue || "photon").toLowerCase();
+  if (provider === "photon") {
+    const config = await loadConfig();
+    setProjectSecret(config.projectId);
+    stdout.write("Photon secret saved in macOS Keychain.\n");
+    return;
+  }
+  if (provider === "elevenlabs") {
+    setElevenLabsApiKey();
+    stdout.write("ElevenLabs API key saved in macOS Keychain.\n");
+    return;
+  }
+  throw new Error("auth provider must be photon or elevenlabs");
 }
 
 async function run() {
@@ -157,6 +174,7 @@ async function doctorResult() {
     } catch (error) {
       checks.push({ check: "photon-auth", ok: false, error: error.message });
     }
+    checks.push({ check: "voice", ok: true, value: voiceCapability(config) });
     if (codex.status === 0) {
       const probe = new CodexAppServer({
         cwd: config.cwd,
@@ -279,16 +297,41 @@ async function sendStack(messages) {
   if (!result.complete) process.exitCode = 1;
 }
 
+async function sendVoice(args) {
+  const parsed = parseSendVoice(args);
+  print(await control("send-voice", parsed));
+}
+
 async function statusResult() {
-  const configured = (await loadConfig()).autoSendFinal;
+  const config = await loadConfig();
+  const configured = config.autoSendFinal;
   const status = await control("status");
   const effective = status.running ? status.autoSendFinal : configured;
+  const capabilities = voiceCapability(config);
+  const voiceRestartRequired = status.running
+    && status.voice?.ttsEngine
+    && (
+      status.voice.ttsEngine !== config.voice.ttsEngine
+      || status.voice.elevenlabs?.sttModel !== config.voice.elevenlabs.sttModel
+      || status.voice.elevenlabs?.ttsModel !== config.voice.elevenlabs.ttsModel
+      || status.voice.elevenlabs?.voiceId !== config.voice.elevenlabs.voiceId
+      || status.voice.elevenlabs?.stability !== config.voice.elevenlabs.stability
+      || status.voice.elevenlabs?.similarityBoost !== config.voice.elevenlabs.similarityBoost
+      || status.voice.elevenlabs?.speed !== config.voice.elevenlabs.speed
+      || status.voice.msd?.voice !== config.voice.msd.voice
+    );
   return {
     ...status,
     autoSendFinal: effective,
     finalDelivery: effective ? "automatic" : "manual",
     configuredAutoSendFinal: configured,
-    restartRequired: status.running && status.autoSendFinal !== configured,
+    restartRequired: Boolean(status.running && status.autoSendFinal !== configured) || Boolean(voiceRestartRequired),
+    voice: {
+      ...capabilities,
+      ...(status.voice || {}),
+      configuredTtsEngine: config.voice.ttsEngine,
+      restartRequired: Boolean(voiceRestartRequired),
+    },
   };
 }
 
@@ -368,6 +411,47 @@ function parseFlags(args) {
   return flags;
 }
 
+function parseSendVoice(args) {
+  const text = [];
+  let instruct = null;
+  for (let index = 0; index < args.length; index += 1) {
+    if (args[index] === "--instruct") {
+      if (instruct !== null) throw new Error("--instruct may be supplied once");
+      instruct = requiredText(args[index + 1]);
+      index += 1;
+      continue;
+    }
+    if (args[index].startsWith("--")) throw new Error(`unknown send-voice option: ${args[index]}`);
+    text.push(args[index]);
+  }
+  return { text: requiredText(text.join(" ")), instruct };
+}
+
+function voiceCapability(config) {
+  let elevenlabsKeyConfigured = false;
+  try {
+    readElevenLabsApiKey();
+    elevenlabsKeyConfigured = true;
+  } catch {}
+  const childEnv = credentialFreeEnvironment(process.env);
+  const msd = spawnSync("msd", ["--version"], { encoding: "utf8", env: childEnv });
+  const converterAvailable = process.platform === "darwin"
+    ? existsSync("/usr/bin/afconvert")
+    : spawnSync("ffmpeg", ["-version"], { encoding: "utf8", env: childEnv }).status === 0;
+  return {
+    sttEngine: "elevenlabs",
+    ttsEngine: config.voice.ttsEngine,
+    elevenlabsKeyConfigured,
+    msdAvailable: msd.status === 0,
+    audioConverterAvailable: converterAvailable,
+    transcriptionReady: elevenlabsKeyConfigured && converterAvailable,
+    speechReady: config.voice.ttsEngine === "elevenlabs"
+      ? elevenlabsKeyConfigured && converterAvailable
+      : msd.status === 0 && converterAvailable,
+    optional: true,
+  };
+}
+
 function print(value) {
   stdout.write(`${JSON.stringify(value, null, 2)}\n`);
 }
@@ -382,24 +466,26 @@ function help(exitCode) {
   stdout.write(`photon-codex
 
   init [--project-id ID --sender E164_NUMBER --cwd PATH]
-  auth set
+  auth set [photon|elevenlabs]
   doctor
   run
   status
   stop
   send TEXT
   send-stack "BUBBLE ONE" "BUBBLE TWO" [...]
+  send-voice [--instruct DELIVERY] TEXT
   progress TEXT
   edit MESSAGE_ID TEXT
   send-file PATH [MIME_TYPE]
   reply MESSAGE_ID TEXT
-  react MESSAGE_ID EMOJI
+  react MESSAGE_ID|current EMOJI
   thread new
   workspace set PATH
   logs [COUNT]
   service install|start|stop|restart|status|uninstall
 
 Automatic final delivery is off by default. Delivery commands remind Codex to send every visible part, then finish with only Answered.
+Eleven v3 accepts [audio tags]. --instruct is for the msd voice engine.
 `);
   process.exitCode = exitCode;
 }

@@ -27,6 +27,11 @@ export function supportsServerRequest(request) {
   return true;
 }
 
+export function supportsTranscribedAnswer(request) {
+  return request?.method === USER_INPUT
+    || (request?.method === MCP_ELICITATION && request?.params?.mode === "form");
+}
+
 export function formatServerRequest(request) {
   const { method, params = {} } = request;
   if (method === COMMAND_APPROVAL || method === LEGACY_COMMAND_APPROVAL) {

@@ -1,14 +1,20 @@
 import { createHash, randomBytes } from "node:crypto";
 import { mkdir, open, writeFile } from "node:fs/promises";
 import path from "node:path";
-import { Spectrum, attachment, markdown, text } from "@spectrum-ts/core";
+import { Spectrum, attachment, markdown, text, voice } from "@spectrum-ts/core";
 import { imessage } from "@spectrum-ts/imessage";
-import { attachmentsPath, loadState, saveState } from "./config.js";
+import { attachmentsPath, loadState, normalizeVoiceConfig, saveState } from "./config.js";
 import { CodexAppServer } from "./codex.js";
 import { startControlServer } from "./control.js";
 import { safeErrorRecord } from "./errors.js";
-import { formatServerRequest, resolveServerRequest, supportsServerRequest } from "./interaction.js";
+import {
+  formatServerRequest,
+  resolveServerRequest,
+  supportsServerRequest,
+  supportsTranscribedAnswer,
+} from "./interaction.js";
 import { logEvent } from "./log.js";
+import { VoiceService } from "./voice.js";
 
 const USER_CONTENT_TYPES = new Set(["text", "markdown", "attachment", "voice", "reaction", "reply"]);
 export const IMESSAGE_EDIT_WINDOW_MS = 15 * 60 * 1000;
@@ -38,17 +44,28 @@ For visible progress, run photon-codex progress "STATUS" once, then photon-codex
   return `This thread is connected to one authorized user through iMessage by photon-codex.
 ${delivery}
 For a multi-bubble answer, run photon-codex send-stack "BUBBLE ONE" "BUBBLE TWO" [...]. On partial failure, do not retry the whole stack; send only the unsent suffix.
+A received voice note is transcribed and labeled. Treat its transcript as the user's message, while allowing for mistakes in names, technical terms, or speech obscured by noise. A brief text steering message during the same task does not by itself change a voice-first reply into a text-only reply.
+When a voice reply fits, run photon-codex send-voice "SPOKEN TEXT". Keep exact links, commands, and filenames in text bubbles. ElevenLabs speech accepts intentional [audio tags]; msd speech accepts --instruct "DELIVERY". React to the latest inbound message with photon-codex react current EMOJI.
+A successful send-voice is the delivered answer. Do not repeat its transcript in the Codex final message; finish privately with exactly Answered.
 To send a file the current Codex sandbox can read, run photon-codex send-file "PATH" [MIME_TYPE]. A successful JSON receipt proves Photon accepted the exact byte snapshot; do not describe that as recipient-visible delivery.
 Received images are native localImage inputs. Other received files are named by local path in the user message; inspect them when relevant.
 Do not expose Photon credentials or hidden transport metadata.`;
 }
 
 export class Bridge {
-  constructor({ config, projectSecret, env = process.env, logger = logEvent }) {
-    this.config = { ...config, autoSendFinal: config.autoSendFinal === true };
+  constructor({ config, projectSecret, env = process.env, logger = logEvent, voiceService = null }) {
+    this.config = {
+      ...config,
+      autoSendFinal: config.autoSendFinal === true,
+      voice: normalizeVoiceConfig(config.voice),
+    };
     this.projectSecret = projectSecret;
     this.env = env;
     this.logger = logger;
+    this.voiceService = voiceService || new VoiceService({
+      config: { ...this.config.voice, maxAttachmentBytes: this.config.maxAttachmentBytes },
+      env,
+    });
     this.state = null;
     this.spectrum = null;
     this.provider = null;
@@ -180,6 +197,57 @@ export class Bridge {
     };
   }
 
+  async sendVoice({ text: value, instruct = null }) {
+    const space = await this.#ensureSpace();
+    let audio;
+    try {
+      audio = await this.voiceService.synthesize(value, instruct);
+    } catch (error) {
+      const safe = safeErrorRecord("voice_send_failed", error);
+      await this.logger("warn", "voice_send_failed", {
+        engine: this.config.voice.ttsEngine,
+        stage: "synthesis",
+        errorCategory: safe.category,
+        errorCode: safe.code,
+      }, this.env);
+      throw error;
+    }
+    try {
+      const sent = requireProviderReceipt(
+        await space.send(voice(audio.bytes, { name: "voice.m4a", mimeType: audio.mimeType })),
+        "voice message",
+      );
+      const metadata = sent.attachmentMetadata?.[0];
+      await this.logger("info", "voice_sent", {
+        engine: audio.engine,
+        size: audio.bytes.byteLength,
+        providerDelivered: sent.isDelivered === true,
+      }, this.env);
+      if (this.activeTurnId) this.#deliveryRecord(this.activeTurnId).voiceDelivered = true;
+      return {
+        providerAccepted: true,
+        messageId: sent.id,
+        engine: audio.engine,
+        model: audio.model,
+        size: audio.bytes.byteLength,
+        providerMimeType: metadata?.mimeType ?? null,
+        providerSize: metadata?.totalBytes ?? null,
+        isSent: sent.isSent ?? null,
+        isDelivered: sent.isDelivered ?? null,
+        transferState: metadata?.transferState ?? null,
+      };
+    } catch (error) {
+      const safe = safeErrorRecord("voice_send_failed", error);
+      await this.logger("warn", "voice_send_failed", {
+        engine: audio.engine,
+        stage: "delivery",
+        errorCategory: safe.category,
+        errorCode: safe.code,
+      }, this.env);
+      throw error;
+    }
+  }
+
   async sendProgress({ text: value }) {
     if (!this.activeTurnId) throw new Error("progress requires an active Codex turn");
     const body = editableText(value);
@@ -260,7 +328,10 @@ export class Bridge {
 
   async reactToMessage({ messageId, emoji }) {
     const space = await this.#ensureSpace();
-    const message = await space.getMessage(requiredText(messageId));
+    const id = requiredText(messageId);
+    const message = id.toLowerCase() === "current"
+      ? this.targetByTurn.get(this.activeTurnId)
+      : await space.getMessage(id);
     if (!message) throw new Error("message not found");
     const reaction = normalizeReaction(emoji);
     const sent = requireProviderReceipt(await message.react(reaction), "reaction");
@@ -275,6 +346,7 @@ export class Bridge {
 
   async handleMessage(space, message) {
     const disposition = messageDisposition(space, message, this.config, this.state);
+    const inboundContentType = unwrapReply(message.content)?.type;
     if (!disposition.accept) {
       if (disposition.record && !this.state.ignoredEventIds.includes(message.id)) {
         await this.#updateState((state) => {
@@ -309,10 +381,12 @@ export class Bridge {
       return;
     }
 
-    const input = await this.#inputFor(message);
+    let inputReady = false;
     try {
       await message.read().catch(() => {});
       await space.startTyping().catch(() => {});
+      const input = await this.#inputFor(message);
+      inputReady = true;
       if (this.activeTurnId) this.deliveryByTurn.delete(this.activeTurnId);
       if (!this.activeTurnId && this.messageQueue.length) {
         await this.#enqueueMessage(input, message, disposition.contentType);
@@ -338,6 +412,10 @@ export class Bridge {
       await this.#recordAccepted(message.id, disposition.contentType);
     } catch (error) {
       await space.stopTyping().catch(() => {});
+      if (inboundContentType === "voice" && !inputReady) {
+        await this.#recordVoiceTranscriptionFailure(message, error, disposition.contentType);
+        return;
+      }
       await this.#recordError("message_failed", error, { contentType: disposition.contentType });
     }
   }
@@ -370,9 +448,14 @@ export class Bridge {
     if (content.type === "markdown") {
       return [textInput(content.markdown)];
     }
-    if (content.type === "attachment" || content.type === "voice") {
+    if (content.type === "voice") {
+      const transcript = await this.voiceService.transcribe(content, this.config.maxAttachmentBytes);
+      await this.logger("info", "voice_transcribed", { engine: "elevenlabs" }, this.env);
+      return [textInput(voiceTranscript(transcript))];
+    }
+    if (content.type === "attachment") {
       const file = await this.#saveInboundFile(message.id, content);
-      const description = `Received ${content.type}: ${file}\nMIME type: ${content.mimeType}${content.duration ? `\nDuration: ${content.duration}s` : ""}`;
+      const description = `Received attachment: ${file}\nMIME type: ${content.mimeType}${content.duration ? `\nDuration: ${content.duration}s` : ""}`;
       if (content.mimeType.startsWith("image/")) {
         return [textInput(description), { type: "localImage", path: file }];
       }
@@ -438,7 +521,7 @@ export class Bridge {
 
   async #handleInteractionMessage(message, contentType) {
     const request = this.pendingRequests[0];
-    const text = messageText(message);
+    let answer = messageText(message);
     await message.read().catch(() => {});
     const replyTargetId = message.content?.type === "reply" ? message.content.target?.id : null;
     if (replyTargetId && !request.promptIds.includes(replyTargetId)) {
@@ -451,14 +534,24 @@ export class Bridge {
       await this.#recordAccepted(message.id, contentType);
       return;
     }
-    if (!text) {
+    const inbound = unwrapReply(message.content);
+    if (!answer && inbound?.type === "voice" && supportsTranscribedAnswer(request)) {
+      try {
+        answer = await this.voiceService.transcribe(inbound, this.config.maxAttachmentBytes);
+        await this.logger("info", "voice_transcribed", { engine: "elevenlabs" }, this.env);
+      } catch (error) {
+        await this.#recordVoiceTranscriptionFailure(message, error, contentType);
+        return;
+      }
+    }
+    if (!answer) {
       await message.reply("Please answer the pending Codex prompt with text.");
       await this.#recordAccepted(message.id, contentType);
       return;
     }
     let result;
     try {
-      result = resolveServerRequest(request, text);
+      result = resolveServerRequest(request, answer);
     } catch (error) {
       await message.reply(error.message);
       await this.#recordAccepted(message.id, contentType);
@@ -534,7 +627,7 @@ export class Bridge {
     }
     const final = storedFinal || finalFromTurn(params.turn);
     let reactionState = this.reactionByTurn.get(turnId);
-    if (params.turn?.status === "completed" && delivery?.stackDelivered) {
+    if (params.turn?.status === "completed" && (delivery?.stackDelivered || delivery?.voiceDelivered)) {
       if (final) {
         const outbound = parseOutboundResponse(stripInternal(final));
         if (outbound.reactionError) {
@@ -610,7 +703,13 @@ export class Bridge {
   #deliveryRecord(turnId) {
     let delivery = this.deliveryByTurn.get(turnId);
     if (!delivery) {
-      delivery = { progress: null, hadFile: false, stackAttempted: false, stackDelivered: false };
+      delivery = {
+        progress: null,
+        hadFile: false,
+        stackAttempted: false,
+        stackDelivered: false,
+        voiceDelivered: false,
+      };
       this.deliveryByTurn.set(turnId, delivery);
     }
     return delivery;
@@ -717,6 +816,7 @@ export class Bridge {
     if (request.command === "send-file") {
       return this.#deliveryResult(await this.sendFile(request));
     }
+    if (request.command === "send-voice") return this.#deliveryResult(await this.sendVoice(request));
     if (request.command === "react") return this.#deliveryResult(await this.reactToMessage(request));
     const message = await space.getMessage(requiredText(request.messageId));
     if (!message) throw new Error("message not found");
@@ -752,6 +852,19 @@ export class Bridge {
       activeTurnId: this.activeTurnId,
       autoSendFinal: this.config.autoSendFinal,
       finalDelivery: this.config.autoSendFinal ? "automatic" : "manual",
+      voice: {
+        sttEngine: "elevenlabs",
+        ttsEngine: this.config.voice.ttsEngine,
+        elevenlabs: {
+          sttModel: this.config.voice.elevenlabs.sttModel,
+          ttsModel: this.config.voice.elevenlabs.ttsModel,
+          voiceId: this.config.voice.elevenlabs.voiceId,
+          stability: this.config.voice.elevenlabs.stability,
+          similarityBoost: this.config.voice.elevenlabs.similarityBoost,
+          speed: this.config.voice.elevenlabs.speed,
+        },
+        msd: { voice: this.config.voice.msd.voice },
+      },
       acceptedMessages: this.state.runtime.acceptedMessages,
       repliesSent: this.state.runtime.repliesSent,
       repliesFailed: this.state.runtime.repliesFailed,
@@ -832,6 +945,19 @@ export class Bridge {
       errorCategory: record.category,
       errorCode: record.code,
     }, this.env);
+  }
+
+  async #recordVoiceTranscriptionFailure(message, error, contentType) {
+    try {
+      requireProviderReceipt(
+        await message.reply("I could not transcribe that voice message. Please resend it or type the request."),
+        "voice transcription failure notice",
+      );
+      await this.#recordAccepted(message.id, "voice-transcription-failed");
+    } catch (noticeError) {
+      await this.#recordError("message_failed", noticeError, { contentType });
+    }
+    await this.#recordError("voice_transcription_failed", error, { engine: "elevenlabs" });
   }
 
   async #updateState(update) {
@@ -1112,6 +1238,11 @@ function truncateUtf8(value, maxBytes) {
 
 function textInput(text) {
   return { type: "text", text, text_elements: [] };
+}
+
+export function voiceTranscript(value) {
+  const transcript = requiredText(value);
+  return `[Transcribed iMessage voice message. Some wording may be inaccurate, especially names, technical terms, or speech obscured by noise.]\n\n${transcript}`;
 }
 
 function messageText(message) {

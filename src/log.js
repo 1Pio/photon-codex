@@ -5,20 +5,33 @@ const MAX_LOG_BYTES = 512 * 1024;
 const LEVELS = new Set(["info", "warn", "error"]);
 const PHASES = new Set(["commentary", "control", "final_answer", "unknown"]);
 const CONTENT_TYPES = new Set([
-  "attachment", "codex-interaction", "expired-codex-interaction", "markdown", "reaction", "reply", "text", "unknown", "voice",
+  "attachment", "codex-interaction", "expired-codex-interaction", "markdown", "reaction", "reply", "text", "unknown", "voice", "voice-transcription-failed",
 ]);
 const OPERATIONS = new Set([
-  "auth", "doctor", "edit", "help", "init", "logs", "progress", "react", "reply", "run", "send", "send-file", "send-stack", "service", "status", "stop", "thread", "workspace",
+  "auth", "doctor", "edit", "help", "init", "logs", "progress", "react", "reply", "run", "send", "send-file", "send-stack", "send-voice", "service", "status", "stop", "thread", "workspace",
 ]);
-const ERROR_CATEGORIES = new Set(["attachment", "codex", "control", "filesystem", "photon", "runtime"]);
+const ERROR_CATEGORIES = new Set(["attachment", "codex", "control", "filesystem", "photon", "runtime", "voice"]);
 const ERROR_CODES = new Set([
-  "authentication", "configuration", "connection", "invalid_input", "not_found", "permission_denied", "provider_rejected", "size_limit", "timeout", "unavailable", "unexpected",
+  "authentication", "configuration", "connection", "invalid_input", "not_found", "permission_denied", "provider_rejected", "rate_limited", "size_limit", "timeout", "unavailable", "unexpected",
 ]);
+const VOICE_ENGINES = new Set(["elevenlabs", "msd"]);
+const VOICE_STAGES = new Set(["delivery", "synthesis"]);
 const EVENT_FIELDS = new Map([
   ["bridge_starting", {}],
   ["bridge_ready", { configParity: booleanValue, threadBound: booleanValue }],
   ["bridge_stopped", {}],
   ["file_sent", { size: countValue, providerDelivered: booleanValue }],
+  ["voice_transcribed", { engine: (value) => enumValue(value, VOICE_ENGINES) }],
+  ["voice_transcription_failed", errorFields({ engine: (value) => enumValue(value, VOICE_ENGINES) })],
+  ["voice_sent", {
+    engine: (value) => enumValue(value, VOICE_ENGINES),
+    size: countValue,
+    providerDelivered: booleanValue,
+  }],
+  ["voice_send_failed", errorFields({
+    engine: (value) => enumValue(value, VOICE_ENGINES),
+    stage: (value) => enumValue(value, VOICE_STAGES),
+  })],
   ["final_suppressed", {}],
   ["progress_sent", {}],
   ["message_edited", { phase: (value) => enumValue(value, PHASES) }],

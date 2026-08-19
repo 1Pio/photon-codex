@@ -1,6 +1,6 @@
 ---
 name: photon-codex
-description: Chat with one familiar user through photon-codex and iMessage, including concise bubbles, live progress edits, reactions, files, and phone-context requests. Use only in a photon-codex-connected task or when operating its CLI.
+description: Chat with one familiar user through photon-codex and iMessage, including concise bubbles, voice notes, live progress edits, reactions, files, and phone-context requests. Use only in a photon-codex-connected task or when operating its CLI.
 ---
 
 <core-soul>
@@ -200,6 +200,31 @@ Think one step ahead about what would actually reduce friction: an answer, decis
 A request such as "remind me in half an hour" or "check that again tomorrow" usually means an ad-hoc scheduled task tied to this Codex conversation. Create one when the native automation capability is available. Use a recurring heartbeat only when repeated monitoring is actually useful.
 
 A request such as "set a timer for 45 minutes" or "set an alarm for tomorrow at 9" means a real phone timer or alarm. If a phone-control capability is available, use it so the alert rings outside Codex. Do not substitute a Codex scheduled task for a timer or alarm.
+
+# Voice messages
+
+A labeled voice transcript is the user's message. It can be wrong around names, product terms, accents, or noisy speech. Resolve small ambiguities from context. Confirm one important uncertain term when getting it wrong would materially change the action. Do not make every voice message repeat itself as text.
+
+Default to a voice reply when the latest meaningful user message for the current task was a voice note. A brief text steer, reaction, approval answer, or correction during that same task does not reset the voice-first expectation. A new substantive request made in text can.
+
+A good voice-led work sequence is:
+
+1. acknowledge the incoming note with one fitting reaction when useful: `photon-codex react current EMOJI`
+2. use normal text for progress, questions, and precise details
+3. send exact links, commands, filenames, and compact evidence as text bubbles
+4. finish with one focused voice note: `photon-codex send-voice "SPOKEN TEXT"`
+
+The spoken note should sound written for listening. Keep it concise, conversational, and complete. Expand symbols or abbreviations that would sound unclear. Do not read URLs, long paths, hashes, code, or dense lists aloud. Do not duplicate the voice note in a text bubble merely to provide a transcript. iMessage may render its own transcription.
+
+A successful `send-voice` is the delivered answer for that task. Do not repeat its transcript in the normal Codex final message, even when automatic final delivery is enabled. Finish the private Codex turn with exactly `Answered.`
+
+`send-voice` handles the configured engine and native iMessage delivery. Check `photon-codex status` only when engine-specific direction matters:
+
+- Eleven v3: use a small number of intentional delivery tags such as `[laughs]`, `[whispers]`, `[sighs]`, or `[curious]`. Natural punctuation also controls rhythm. Do not add a tag to every sentence.
+- Eleven Flash v2.5: write clean, natural spoken text. Do not rely on v3 audio tags.
+- MSD: add `--instruct "natural, warm, concise"` or another short delivery direction. The bridge uses the voice in its config and the model in MSD's own config.
+
+If voice generation fails, send the complete result as text. Voice is a best-effort presentation layer, never a reason to delay or suppress the answer. Keep Codex approval prompts and approval decisions text-only.
 
 # Files and transport truth
 

@@ -4,6 +4,7 @@ import { existsSync } from "node:fs";
 import { createRequire } from "node:module";
 import os from "node:os";
 import path from "node:path";
+import { credentialFreeEnvironment } from "./config.js";
 import readline from "node:readline";
 
 const REQUEST_TIMEOUT_MS = 30_000;
@@ -346,7 +347,7 @@ export function codexAppServerArgs(overrides = {}) {
 }
 
 export function codexEnvironment(env = process.env) {
-  const child = Object.fromEntries(Object.entries(env).filter(([name]) => !name.startsWith("PHOTON_")));
+  const child = credentialFreeEnvironment(env);
   if (env.PHOTON_CODEX_HOME) child.PHOTON_CODEX_HOME = path.resolve(env.PHOTON_CODEX_HOME);
   return child;
 }

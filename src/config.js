@@ -14,6 +14,15 @@ const REASONING_EFFORTS = new Map([
 ]);
 const DISPLAY_REASONING_EFFORTS = new Map(Array.from(REASONING_EFFORTS, ([display, native]) => [native, display]));
 const FOLLOW_UP_MODES = new Set(["queue", "steer"]);
+const ELEVENLABS_SPEECH_MODELS = new Map([
+  ["eleven v3", "eleven_v3"],
+  ["eleven flash v2.5", "eleven_flash_v2_5"],
+]);
+const DISPLAY_ELEVENLABS_SPEECH_MODELS = new Map(Array.from(
+  ELEVENLABS_SPEECH_MODELS,
+  ([display, native]) => [native, display.replace(/^eleven/, "Eleven").replace("flash", "Flash")],
+));
+const ELEVENLABS_KEYCHAIN_ACCOUNT = "elevenlabs";
 
 export const DEFAULT_CODEX_OVERRIDES = Object.freeze({
   reasoningEffort: "medium",
@@ -21,6 +30,18 @@ export const DEFAULT_CODEX_OVERRIDES = Object.freeze({
   followUpMode: "steer",
 });
 export const DEFAULT_AUTO_SEND_FINAL = false;
+export const DEFAULT_VOICE_CONFIG = Object.freeze({
+  ttsEngine: "elevenlabs",
+  elevenlabs: Object.freeze({
+    sttModel: "scribe_v2",
+    ttsModel: "eleven_v3",
+    voiceId: "FSZ4QLofSALZxepAyq63",
+    stability: 0.5,
+    similarityBoost: 0.75,
+    speed: 1,
+  }),
+  msd: Object.freeze({ voice: null }),
+});
 
 export function appHome(env = process.env) {
   return path.resolve(env.PHOTON_CODEX_HOME || path.join(os.homedir(), ".config", "photon-codex"));
@@ -44,6 +65,12 @@ export function attachmentsPath(env = process.env) {
 
 export function runtimeLogPath(env = process.env) {
   return path.join(appHome(env), "runtime.log");
+}
+
+export function credentialFreeEnvironment(env = process.env) {
+  return Object.fromEntries(Object.entries(env).filter(([name]) =>
+    !name.startsWith("PHOTON_") && name !== "ELEVENLABS_API_KEY",
+  ));
 }
 
 export async function ensureHome(env = process.env) {
@@ -88,6 +115,7 @@ export async function loadConfig(env = process.env) {
     maxAttachmentBytes: Number(env.PHOTON_CODEX_MAX_ATTACHMENT_BYTES || stored.maxAttachmentBytes || 50 * 1024 * 1024),
     autoSendFinal: normalizeAutoSendFinal(stored.autoSendFinal),
     codexOverrides: normalizeCodexOverrides(stored.codexOverrides),
+    voice: normalizeVoiceConfig(stored.voice),
   };
   if (!config.projectId) throw new Error("Photon project ID is missing. Run `photon-codex init`.");
   config.allowedSender = normalizeSender(config.allowedSender);
@@ -112,6 +140,7 @@ export async function saveConfig(config, env = process.env) {
     maxAttachmentBytes: Number(config.maxAttachmentBytes || 50 * 1024 * 1024),
     autoSendFinal: normalizeAutoSendFinal(config.autoSendFinal),
     ...(Object.keys(codexOverrides).length ? { codexOverrides: serializeCodexOverrides(codexOverrides) } : {}),
+    voice: serializeVoiceConfig(normalizeVoiceConfig(config.voice)),
   };
   if (!value.projectId) throw new Error("projectId is required");
   await ensureHome(env);
@@ -214,6 +243,22 @@ export function readProjectSecret(projectId, env = process.env) {
   }
 }
 
+export function readElevenLabsApiKey(env = process.env) {
+  if (env.ELEVENLABS_API_KEY) return env.ELEVENLABS_API_KEY;
+  if (process.platform !== "darwin") {
+    throw new Error("ELEVENLABS_API_KEY is missing");
+  }
+  try {
+    return execFileSync(
+      "security",
+      ["find-generic-password", "-a", ELEVENLABS_KEYCHAIN_ACCOUNT, "-s", KEYCHAIN_SERVICE, "-w"],
+      { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] },
+    ).trim();
+  } catch {
+    throw new Error("ElevenLabs API key is missing. Run `photon-codex auth set elevenlabs`.");
+  }
+}
+
 export function setProjectSecret(projectId) {
   if (process.platform !== "darwin") {
     throw new Error("Keychain setup is available on macOS. Set PHOTON_PROJECT_SECRET on this platform.");
@@ -226,6 +271,18 @@ export function setProjectSecret(projectId) {
   if (result.status !== 0) throw new Error("The Photon secret was not saved to Keychain");
 }
 
+export function setElevenLabsApiKey() {
+  if (process.platform !== "darwin") {
+    throw new Error("Keychain setup is available on macOS. Set ELEVENLABS_API_KEY on this platform.");
+  }
+  const result = spawnSync(
+    "security",
+    ["add-generic-password", "-U", "-a", ELEVENLABS_KEYCHAIN_ACCOUNT, "-s", KEYCHAIN_SERVICE, "-w"],
+    { stdio: "inherit" },
+  );
+  if (result.status !== 0) throw new Error("The ElevenLabs API key was not saved to Keychain");
+}
+
 export function redactConfig(config) {
   return {
     projectId: config.projectId,
@@ -234,6 +291,7 @@ export function redactConfig(config) {
     maxAttachmentBytes: config.maxAttachmentBytes,
     autoSendFinal: config.autoSendFinal,
     codexOverrides: config.codexOverrides || {},
+    voice: serializeVoiceConfig(config.voice),
   };
 }
 
@@ -278,6 +336,57 @@ export function normalizeCodexOverrides(value) {
   return overrides;
 }
 
+export function normalizeVoiceConfig(value) {
+  if (value === undefined) return cloneDefaultVoiceConfig();
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new Error("voice must be an object");
+  }
+  rejectUnknown(value, ["ttsEngine", "elevenlabs", "msd"], "voice");
+  const ttsEngine = optionalEngine(value.ttsEngine, "elevenlabs", ["elevenlabs", "msd"], "voice.ttsEngine");
+  const elevenlabs = value.elevenlabs ?? {};
+  if (!elevenlabs || typeof elevenlabs !== "object" || Array.isArray(elevenlabs)) {
+    throw new Error("voice.elevenlabs must be an object");
+  }
+  rejectUnknown(
+    elevenlabs,
+    ["sttModel", "ttsModel", "voiceId", "stability", "similarityBoost", "speed"],
+    "voice.elevenlabs",
+  );
+  const sttModel = optionalText(elevenlabs.sttModel, "scribe_v2", "voice.elevenlabs.sttModel");
+  if (sttModel !== "scribe_v2") {
+    throw new Error("voice.elevenlabs.sttModel must be scribe_v2");
+  }
+  const ttsModelValue = optionalText(elevenlabs.ttsModel, "Eleven v3", "voice.elevenlabs.ttsModel");
+  const ttsModel = ELEVENLABS_SPEECH_MODELS.get(ttsModelValue.toLowerCase())
+    || (DISPLAY_ELEVENLABS_SPEECH_MODELS.has(ttsModelValue) ? ttsModelValue : null);
+  if (!ttsModel) {
+    throw new Error("voice.elevenlabs.ttsModel must be Eleven v3 or Eleven Flash v2.5");
+  }
+  const voiceId = optionalText(elevenlabs.voiceId, DEFAULT_VOICE_CONFIG.elevenlabs.voiceId, "voice.elevenlabs.voiceId");
+  if (!/^[A-Za-z0-9_-]{1,128}$/.test(voiceId)) throw new Error("voice.elevenlabs.voiceId must be a valid voice ID");
+  const stability = boundedNumber(elevenlabs.stability, 0.5, 0, 1, "voice.elevenlabs.stability");
+  const similarityBoost = boundedNumber(
+    elevenlabs.similarityBoost,
+    0.75,
+    0,
+    1,
+    "voice.elevenlabs.similarityBoost",
+  );
+  const speed = boundedNumber(elevenlabs.speed, 1, 0.7, 1.2, "voice.elevenlabs.speed");
+  const msd = value.msd ?? {};
+  if (!msd || typeof msd !== "object" || Array.isArray(msd)) throw new Error("voice.msd must be an object");
+  rejectUnknown(msd, ["voice"], "voice.msd");
+  const msdVoice = msd.voice == null ? null : optionalText(msd.voice, null, "voice.msd.voice");
+  if (msdVoice && (msdVoice.length > 128 || /[\u0000-\u001F\u007F]/.test(msdVoice))) {
+    throw new Error("voice.msd.voice must be a single voice selector up to 128 characters");
+  }
+  return {
+    ttsEngine,
+    elevenlabs: { sttModel, ttsModel, voiceId, stability, similarityBoost, speed },
+    msd: { voice: msdVoice },
+  };
+}
+
 function serializeCodexOverrides(overrides) {
   return {
     ...(overrides.reasoningEffort ? {
@@ -286,4 +395,53 @@ function serializeCodexOverrides(overrides) {
     ...(Object.hasOwn(overrides, "fastMode") ? { fastMode: overrides.fastMode } : {}),
     ...(Object.hasOwn(overrides, "followUpMode") ? { followUpMode: overrides.followUpMode } : {}),
   };
+}
+
+function serializeVoiceConfig(voice = DEFAULT_VOICE_CONFIG) {
+  const normalized = normalizeVoiceConfig(voice);
+  return {
+    ttsEngine: normalized.ttsEngine,
+    elevenlabs: {
+      sttModel: normalized.elevenlabs.sttModel,
+      ttsModel: DISPLAY_ELEVENLABS_SPEECH_MODELS.get(normalized.elevenlabs.ttsModel),
+      voiceId: normalized.elevenlabs.voiceId,
+      stability: normalized.elevenlabs.stability,
+      similarityBoost: normalized.elevenlabs.similarityBoost,
+      speed: normalized.elevenlabs.speed,
+    },
+    msd: { voice: normalized.msd.voice },
+  };
+}
+
+function cloneDefaultVoiceConfig() {
+  return {
+    ttsEngine: DEFAULT_VOICE_CONFIG.ttsEngine,
+    elevenlabs: { ...DEFAULT_VOICE_CONFIG.elevenlabs },
+    msd: { ...DEFAULT_VOICE_CONFIG.msd },
+  };
+}
+
+function rejectUnknown(value, allowed, name) {
+  const unknown = Object.keys(value).filter((key) => !allowed.includes(key));
+  if (unknown.length) throw new Error(`${name} contains unsupported field: ${unknown.join(", ")}`);
+}
+
+function optionalEngine(value, fallback, allowed, name) {
+  const engine = optionalText(value, fallback, name).toLowerCase();
+  if (!allowed.includes(engine)) throw new Error(`${name} must be ${allowed.join(" or ")}`);
+  return engine;
+}
+
+function optionalText(value, fallback, name) {
+  if (value === undefined) return fallback;
+  if (typeof value !== "string" || !value.trim()) throw new Error(`${name} must be a non-empty string`);
+  return value.trim();
+}
+
+function boundedNumber(value, fallback, minimum, maximum, name) {
+  if (value === undefined) return fallback;
+  if (typeof value !== "number" || !Number.isFinite(value) || value < minimum || value > maximum) {
+    throw new Error(`${name} must be a number from ${minimum} to ${maximum}`);
+  }
+  return value;
 }
