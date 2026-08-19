@@ -3,9 +3,9 @@
 [![Node.js 20+](https://img.shields.io/badge/Node.js-20%2B-43853D)](https://nodejs.org/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-Chat with your Codex from iMessage.
+Chat with your Codex over iMessage.
 
-Send a task, image, document, or voice note. Codex works in your chosen workspace on your Mac and answers in the same conversation with text, files, or emoji reactions.
+Send a task, image, document, or voice note. Codex works in your chosen workspace on your Mac and answers in the same conversation with text, voice notes, files, or emoji reactions.
 
 Follow up while it works. Reply to questions and approve commands or file changes from Messages. After a restart, the bridge resumes the task with your normal Codex configuration and permissions.
 
@@ -13,14 +13,16 @@ Follow up while it works. Reply to questions and approve commands or file change
 flowchart LR
     U[iMessage]
     P[Photon]
+    E["Optional STT / TTS engine"]
     subgraph MAC["Your Mac"]
         B[photon-codex] <--> C["Codex task + workspace"]
     end
     U <--> P
     P <-->|"authorized chat"| B
+    B <--> E
 ```
 
-`photon-codex` accepts one sender in one direct conversation. It is one Node.js process. There is no public webhook, model API key, database, framework, or separate queue service.
+`photon-codex` accepts one sender in one direct conversation. It is one Node.js process. There is no public webhook, OpenAI API key, database, framework, or separate queue service.
 
 ## Install
 
@@ -29,7 +31,8 @@ You need:
 - Node.js 20 or newer
 - An authenticated local [Codex CLI](https://learn.chatgpt.com/docs/codex/cli)
 - A Photon Spectrum project connected to [iMessage](https://photon.codes/platform/imessage)
-- A phone number in E.164 format (`+...`) that you control or have explicit consent to use
+- Your personal phone number in E.164 format (`+...`)
+- Optional: an ElevenLabs API key with access to STT, TTS, or both
 
 Then:
 
@@ -133,7 +136,7 @@ Incoming iMessage voice notes are transcribed with Scribe v2 and clearly labeled
 }
 ```
 
-`autoSendFinal` is `false` by default. In this mode, normal Codex final messages, commentary, reasoning summaries, tool calls, tool output, and reaction directives are never interpreted as iMessage output. Codex must use `send`, `send-stack`, `edit`, `reply`, `react`, or `send-file` for every user-visible result. Approvals and failure notices continue to work normally.
+`autoSendFinal` is `false` by default. In this mode, normal Codex final messages, commentary, reasoning summaries, tool calls, tool output, and reaction directives are never interpreted as iMessage output. Codex must use `send`, `send-stack`, `send-voice`, `edit`, `reply`, `react`, or `send-file` for every user-visible result. Approvals and failure notices continue to work normally.
 
 Set `autoSendFinal` to `true` to deliver the normal Codex final answer automatically. That mode also enables automatic progress-to-final editing when the result is short plain text and remains inside Apple's edit window. Long, rich, file-bearing, expired, or failed edits use the normal reliable final path.
 
@@ -166,6 +169,6 @@ Run `npm test` for the unit tests. Run `npm run test:live` to test against your 
 
 Protocol references: [Codex app-server](https://learn.chatgpt.com/docs/app-server), [Spectrum edits, reactions, and replies](https://photon.codes/docs/spectrum-ts/reactions-and-replies), [Spectrum voice messages](https://photon.codes/docs/spectrum-ts/content/voice), [ElevenLabs speech to text](https://elevenlabs.io/docs/api-reference/speech-to-text/convert), [ElevenLabs text to speech](https://elevenlabs.io/docs/api-reference/text-to-speech/convert), and [Apple's iMessage edit limits](https://support.apple.com/en-ae/guide/iphone/iphe67195653/ios).
 
-MIT licensed. photon-codex is independent and is not affiliated with Photon, OpenAI, or Apple. Their names and marks belong to their owners.
+MIT licensed. photon-codex is independent and is not affiliated with Photon, OpenAI, Apple, or ElevenLabs. Their names and marks belong to their owners.
 
 Report vulnerabilities through [GitHub private vulnerability reporting](https://github.com/1Pio/photon-codex/security/advisories/new). That channel does not promise support or a response.

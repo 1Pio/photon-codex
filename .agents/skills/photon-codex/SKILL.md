@@ -83,7 +83,7 @@ A valid three-bubble answer might be:
 
 But the following may work just as well:
 
-1. `found it: 🔗 open it: URL`
+1. `found it: 🔗 URL`
 2. a compact explanation
 
 Send messages as soon as they are useful. Do not wait until you have mapped every bubble perfectly. Send each part when it makes sense and let the exchange feel like a natural conversation.
@@ -106,6 +106,8 @@ For a complete answer with two or more bubbles, use one ordered call:
 
 A complete stack is the delivered answer. Check every returned message ID. If the result is partial, never retry the whole stack. In manual mode, send only the bubbles at or after `firstUnsentIndex`; in automatic mode, put only that unsent suffix in the normal final answer.
 
+A stack contains 2 to 16 bubbles and sends them in order. The sends are not atomic.
+
 Use `photon-codex send "TEXT"` for one deliberate standalone bubble. In manual mode, even a one-bubble answer uses this command.
 
 A bubble within a sequence may be only "wait", "yep", "done", one emoji, or one useful link when that is its complete conversational beat. A one-bubble answer must complete the response by itself.
@@ -115,6 +117,27 @@ Brief replies rarely need headings. Keep the whole sequence short unless depth g
 Treat terse follow-ups as conversation, not malformed prompts. Resolve "that one", "no", "the other one", or "do it" from recent context when unambiguous.
 
 Ask one precise question only when the answer changes what you should do. Make it short enough to answer from the lock screen.
+
+# Command reference
+
+Use these commands for visible iMessage delivery and bridge control:
+
+| Task | Command |
+| --- | --- |
+| Check the bridge and delivery mode | `photon-codex status` |
+| Send one bubble | `photon-codex send "TEXT"` |
+| Send ordered bubbles | `photon-codex send-stack "BUBBLE ONE" "BUBBLE TWO" [...]` |
+| Send a voice note | `photon-codex send-voice "SPOKEN TEXT"` |
+| Direct MSD delivery | `photon-codex send-voice --instruct "DELIVERY" "SPOKEN TEXT"` |
+| Send visible progress | `photon-codex progress "STATUS"` |
+| Edit an outbound message | `photon-codex edit MESSAGE_ID "UPDATED TEXT"` |
+| Send a document | `photon-codex send-file "PATH" [MIME_TYPE]` |
+| Reply to one message | `photon-codex reply MESSAGE_ID "TEXT"` |
+| React to one message | `photon-codex react MESSAGE_ID EMOJI` |
+| React to the active request | `photon-codex react current EMOJI` |
+| Read recent bridge events | `photon-codex logs 50` |
+
+Every delivery command returns JSON. Read its receipt before treating the action as successful or deciding what to retry. In manual mode, follow its reminder that every visible part must go through the CLI. A successful receipt proves Photon accepted the action, not that the user saw it. Keep raw log and status output private unless it has been manually reviewed.
 
 # Targeted replies
 
@@ -137,6 +160,8 @@ Keep the returned message ID as the active status for that request. Prefer one l
 `photon-codex edit MESSAGE_ID "UPDATED STATUS"`
 
 Do this instead of stacking several progress messages. Apple permits at most five edits within 15 minutes. photon-codex allows four progress updates and reserves one edit for completion. Stop when the command reports no remaining progress edits.
+
+Progress state does not survive a service restart.
 
 Only edit a status while all of these remain true:
 
@@ -204,6 +229,8 @@ A request such as "set a timer for 45 minutes" or "set an alarm for tomorrow at 
 # Voice messages
 
 A labeled voice transcript is the user's message. It can be wrong around names, product terms, accents, or noisy speech. Resolve small ambiguities from context. Confirm one important uncertain term when getting it wrong would materially change the action. Do not make every voice message repeat itself as text.
+
+The bridge discards the source audio after transcription. The transcript becomes ordinary Codex conversation content and may enter the durable follow-up queue.
 
 Default to a voice reply when the latest meaningful user message for the current task was a voice note. A brief text steer, reaction, approval answer, or correction during that same task does not reset the voice-first expectation. A new substantive request made in text can.
 
