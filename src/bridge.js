@@ -16,18 +16,36 @@ export const IMESSAGE_EDIT_LIMIT = 5;
 export const PROGRESS_EDIT_LIMIT = IMESSAGE_EDIT_LIMIT - 1;
 export const EDIT_TEXT_LIMIT = 4000;
 export const STACK_MESSAGE_LIMIT = 16;
-const TRANSPORT_INSTRUCTIONS = `This thread is connected to one authorized user through iMessage by photon-codex.
-The bridge delivers your final answer automatically, so do not send it through another messaging tool.
-To react to the current iMessage, begin an assistant message with [[photon_reaction:EMOJI]]. Use a directive-only commentary message when the reaction should appear before the final answer, or begin the final answer with it. The bridge removes the directive. Use exactly one emoji grapheme.
-For visible progress, run photon-codex progress "STATUS" once, then photon-codex edit MESSAGE_ID "UPDATED STATUS" only when something material changes. Four progress edits are allowed; the fifth Apple edit is reserved for a plain-text final answer. Edit failures never replace normal final delivery.
-For a complete multi-bubble answer, run photon-codex send-stack "BUBBLE ONE" "BUBBLE TWO" [...]. A complete stack is the turn's delivered answer. On partial failure, do not retry the whole stack; put only the unsent remainder in the normal final answer.
+export const MANUAL_COMPLETION_REMINDER = "Automatic final delivery is off. Send every user-visible part through photon-codex, then finish the Codex turn with only Answered.";
+
+export function withCompletionReminder(result, autoSendFinal) {
+  if (autoSendFinal) return result;
+  return {
+    ...result,
+    autoSendFinal: false,
+    completionReminder: MANUAL_COMPLETION_REMINDER,
+  };
+}
+
+export function transportInstructions(autoSendFinal) {
+  const delivery = autoSendFinal
+    ? `The bridge delivers your final answer automatically, so do not send it through another messaging tool.
+To react to the current iMessage automatically, begin an assistant message with [[photon_reaction:EMOJI]]. Use a directive-only commentary message when the reaction should appear before the final answer, or begin the final answer with it. The bridge removes the directive. Use exactly one emoji grapheme.
+For visible progress, run photon-codex progress "STATUS" once, then photon-codex edit MESSAGE_ID "UPDATED STATUS" only when something material changes. Four progress edits are allowed; the fifth Apple edit is reserved for a plain-text final answer. Edit failures never replace normal final delivery.`
+    : `Automatic final delivery is disabled. No final answer, commentary, reasoning summary, tool call, tool output, or reaction directive is interpreted or sent to iMessage.
+Send every user-visible message, file, reply, or reaction with the photon-codex CLI. Use photon-codex send-stack for a complete answer with multiple bubbles. After the complete answer is delivered, end the Codex turn with exactly Answered.
+For visible progress, run photon-codex progress "STATUS" once, then photon-codex edit MESSAGE_ID "UPDATED STATUS" only when something material changes. Automatic progress-to-final editing is disabled; send or explicitly edit the final user-visible text yourself.`;
+  return `This thread is connected to one authorized user through iMessage by photon-codex.
+${delivery}
+For a multi-bubble answer, run photon-codex send-stack "BUBBLE ONE" "BUBBLE TWO" [...]. On partial failure, do not retry the whole stack; send only the unsent suffix.
 To send a file the current Codex sandbox can read, run photon-codex send-file "PATH" [MIME_TYPE]. A successful JSON receipt proves Photon accepted the exact byte snapshot; do not describe that as recipient-visible delivery.
 Received images are native localImage inputs. Other received files are named by local path in the user message; inspect them when relevant.
 Do not expose Photon credentials or hidden transport metadata.`;
+}
 
 export class Bridge {
   constructor({ config, projectSecret, env = process.env, logger = logEvent }) {
-    this.config = config;
+    this.config = { ...config, autoSendFinal: config.autoSendFinal === true };
     this.projectSecret = projectSecret;
     this.env = env;
     this.logger = logger;
@@ -81,7 +99,7 @@ export class Bridge {
       cwd: this.config.cwd,
       threadId: this.state.threadId,
       env: this.env,
-      transportInstructions: TRANSPORT_INSTRUCTIONS,
+      transportInstructions: transportInstructions(this.config.autoSendFinal),
       codexOverrides: this.config.codexOverrides,
       onThreadId: async (threadId) => {
         await this.#updateState((state) => { state.threadId = threadId; });
@@ -185,8 +203,11 @@ export class Bridge {
     const progress = delivery?.progress?.message.id === id ? delivery.progress : null;
     const message = progress?.message || await space.getMessage(id);
     if (!message) throw new Error("message not found");
-    if (progress && progress.editCount >= PROGRESS_EDIT_LIMIT) {
-      throw new Error("four progress edits are already used; the fifth iMessage edit is reserved for the final answer");
+    const controlEditLimit = this.config.autoSendFinal ? PROGRESS_EDIT_LIMIT : IMESSAGE_EDIT_LIMIT;
+    if (progress && progress.editCount >= controlEditLimit) {
+      throw new Error(this.config.autoSendFinal
+        ? "four progress edits are already used; the fifth iMessage edit is reserved for the final answer"
+        : "the fifth and final iMessage edit is already used");
     }
     return this.#editTextMessage(message, body, { phase: "control", progress });
   }
@@ -473,6 +494,7 @@ export class Bridge {
       return;
     }
     if (method === "item/completed" && params.item?.type === "agentMessage") {
+      if (!this.config.autoSendFinal) return;
       const message = params.item.text?.trim() || "";
       const outbound = parseOutboundResponse(stripInternal(message));
       if (params.item.phase !== "final_answer" && outbound.reaction) {
@@ -491,8 +513,7 @@ export class Bridge {
     if (method !== "turn/completed") return;
     const turnId = params.turn?.id || this.activeTurnId;
     const target = this.targetByTurn.get(turnId);
-    const final = this.finalByTurn.get(turnId) || finalFromTurn(params.turn);
-    let reactionState = this.reactionByTurn.get(turnId);
+    const storedFinal = this.finalByTurn.get(turnId);
     const delivery = this.deliveryByTurn.get(turnId);
     this.activeTurnId = null;
     this.targetByTurn.delete(turnId);
@@ -504,6 +525,15 @@ export class Bridge {
       await this.#startQueuedTurn();
       return;
     }
+    if (!this.config.autoSendFinal && params.turn?.status === "completed") {
+      this.reactionByTurn.delete(turnId);
+      this.deliveryByTurn.delete(turnId);
+      await this.logger("info", "final_suppressed", {}, this.env);
+      await this.#startQueuedTurn();
+      return;
+    }
+    const final = storedFinal || finalFromTurn(params.turn);
+    let reactionState = this.reactionByTurn.get(turnId);
     if (params.turn?.status === "completed" && delivery?.stackDelivered) {
       if (final) {
         const outbound = parseOutboundResponse(stripInternal(final));
@@ -596,8 +626,8 @@ export class Bridge {
         targetMessageId: message.id,
         editWindowEndsAt: timing.editWindowEndsAt,
         observedEdits: progress?.editCount ?? null,
-        remainingProgressEdits: progress ? PROGRESS_EDIT_LIMIT - progress.editCount : null,
-        finalEditReserved: Boolean(progress),
+        remainingProgressEdits: progress ? Math.max(PROGRESS_EDIT_LIMIT - progress.editCount, 0) : null,
+        finalEditReserved: Boolean(progress && progress.editCount < IMESSAGE_EDIT_LIMIT),
       };
     }
     try {
@@ -622,10 +652,15 @@ export class Bridge {
       targetMessageId: message.id,
       editWindowEndsAt: timing.editWindowEndsAt,
       observedEdits: progress?.editCount ?? null,
-      remainingProgressEdits: progress ? PROGRESS_EDIT_LIMIT - progress.editCount : null,
-      finalEditReserved: Boolean(progress),
+      remainingProgressEdits: progress ? Math.max(PROGRESS_EDIT_LIMIT - progress.editCount, 0) : null,
+      finalEditReserved: Boolean(progress && progress.editCount < IMESSAGE_EDIT_LIMIT),
       ...(progress?.editCount === PROGRESS_EDIT_LIMIT ? {
-        warning: "Four progress edits are used. The fifth and final iMessage edit is reserved for completion.",
+        warning: this.config.autoSendFinal
+          ? "Four progress edits are used. The fifth and final iMessage edit is reserved for completion."
+          : "Four progress updates are used. Use the one remaining edit only for completion.",
+      } : {}),
+      ...(!this.config.autoSendFinal && progress?.editCount === IMESSAGE_EDIT_LIMIT ? {
+        warning: "This message has used Apple's fifth and final edit.",
       } : {}),
       ...(!progress ? {
         warning: "Apple allows at most five edits within 15 minutes. Earlier edits outside this bridge run are not observable.",
@@ -634,6 +669,7 @@ export class Bridge {
   }
 
   async #finalizeProgress(turnId, finalText) {
+    if (!this.config.autoSendFinal) return false;
     const delivery = this.deliveryByTurn.get(turnId);
     const progress = delivery?.progress;
     if (!progress || delivery.hadFile || delivery.stackAttempted || !isPlainTextFinal(finalText)) return false;
@@ -673,20 +709,20 @@ export class Bridge {
     const space = await this.#ensureSpace();
     if (request.command === "send") {
       const sent = await space.send(markdown(requiredText(request.text)));
-      return { messageId: sent?.id || null };
+      return this.#deliveryResult({ messageId: sent?.id || null });
     }
-    if (request.command === "send-stack") return this.sendStack(request);
-    if (request.command === "progress") return this.sendProgress(request);
-    if (request.command === "edit") return this.editMessage(request);
+    if (request.command === "send-stack") return this.#deliveryResult(await this.sendStack(request));
+    if (request.command === "progress") return this.#deliveryResult(await this.sendProgress(request));
+    if (request.command === "edit") return this.#deliveryResult(await this.editMessage(request));
     if (request.command === "send-file") {
-      return this.sendFile(request);
+      return this.#deliveryResult(await this.sendFile(request));
     }
-    if (request.command === "react") return this.reactToMessage(request);
+    if (request.command === "react") return this.#deliveryResult(await this.reactToMessage(request));
     const message = await space.getMessage(requiredText(request.messageId));
     if (!message) throw new Error("message not found");
     if (request.command === "reply") {
       const sent = await message.reply(markdown(requiredText(request.text)));
-      return { messageId: sent?.id || null };
+      return this.#deliveryResult({ messageId: sent?.id || null });
     }
     throw new Error(`unknown command: ${request.command}`);
   }
@@ -696,6 +732,10 @@ export class Bridge {
     if (!this.state.spaceId) throw new Error("No iMessage conversation is bound yet. Send the Photon line a message first.");
     this.space = await this.provider.space.get(this.state.spaceId);
     return this.space;
+  }
+
+  #deliveryResult(result) {
+    return withCompletionReminder(result, this.config.autoSendFinal);
   }
 
   status() {
@@ -710,6 +750,8 @@ export class Bridge {
       queuedMessages: this.messageQueue.length,
       spaceBound: Boolean(this.state.spaceId),
       activeTurnId: this.activeTurnId,
+      autoSendFinal: this.config.autoSendFinal,
+      finalDelivery: this.config.autoSendFinal ? "automatic" : "manual",
       acceptedMessages: this.state.runtime.acceptedMessages,
       repliesSent: this.state.runtime.repliesSent,
       repliesFailed: this.state.runtime.repliesFailed,

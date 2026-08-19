@@ -19,6 +19,7 @@ const EVENT_FIELDS = new Map([
   ["bridge_ready", { configParity: booleanValue, threadBound: booleanValue }],
   ["bridge_stopped", {}],
   ["file_sent", { size: countValue, providerDelivered: booleanValue }],
+  ["final_suppressed", {}],
   ["progress_sent", {}],
   ["message_edited", { phase: (value) => enumValue(value, PHASES) }],
   ["message_edit_failed", errorFields({ phase: (value) => enumValue(value, PHASES) })],

@@ -76,9 +76,9 @@ You just send an iMessage. Codex uses the commands below when it needs to operat
 | Change workspace | `photon-codex workspace set /path/to/workspace` |
 | Restart the service | `photon-codex service restart` |
 
-Every control command returns JSON. Run `photon-codex logs 50` to read recent events.
+Every delivery command returns JSON. With the default manual final-delivery mode, its receipt also reminds Codex that every visible part must be sent through the CLI. Run `photon-codex logs 50` to read recent events.
 
-`progress` creates one plain-text status for the active turn. `edit` can update any outbound text message still inside Apple's edit window. Apple currently permits five edits within 15 minutes; photon-codex caps progress updates at four and reserves one edit for a short plain-text final. Rich, long, file-bearing, expired, or failed edits fall back to the normal final delivery path. No progress state survives a restart.
+`progress` creates one plain-text status for the active turn. `edit` can update any outbound text message still inside Apple's edit window. Apple currently permits five edits within 15 minutes. After four progress edits, photon-codex warns that only the completion edit should remain. In automatic mode, that fifth edit is reserved for a short plain-text final. No progress state survives a restart.
 
 `send-stack` accepts two to sixteen positional arguments and sends them in order. Its JSON result lists one receipt per bubble. A partial result stops at the first failure and reports `firstUnsentIndex`; retry only the unsent suffix. Multiple iMessage sends are not atomic.
 
@@ -94,6 +94,7 @@ Every control command returns JSON. Run `photon-codex logs 50` to read recent ev
   "allowedSender": "<E.164 number you control>",
   "cwd": "/path/to/workspace",
   "maxAttachmentBytes": 52428800,
+  "autoSendFinal": false,
   "codexOverrides": {
     "reasoningEffort": "medium",
     "fastMode": true,
@@ -102,13 +103,17 @@ Every control command returns JSON. Run `photon-codex logs 50` to read recent ev
 }
 ```
 
+`autoSendFinal` is `false` by default. In this mode, normal Codex final messages, commentary, reasoning summaries, tool calls, tool output, and reaction directives are never interpreted as iMessage output. Codex must use `send`, `send-stack`, `edit`, `reply`, `react`, or `send-file` for every user-visible result. Approvals and failure notices continue to work normally.
+
+Set `autoSendFinal` to `true` to deliver the normal Codex final answer automatically. That mode also enables automatic progress-to-final editing when the result is short plain text and remains inside Apple's edit window. Long, rich, file-bearing, expired, or failed edits use the normal reliable final path.
+
 | Override | Accepted values |
 | --- | --- |
 | `reasoningEffort` | `light`, `medium`, `high`, `extra high`, `max` |
 | `fastMode` | `true`, `false` |
 | `followUpMode` | `steer`, `queue` |
 
-Leave an override out to use your normal Codex setting. photon-codex does not override anything else.
+Leave an override out to use your normal Codex setting. photon-codex does not override anything else. `autoSendFinal` is a bridge setting, not a Codex override.
 
 Restart the service after changing the file. Set `PHOTON_CODEX_HOME` if you want the runtime files somewhere other than `~/.config/photon-codex/`.
 

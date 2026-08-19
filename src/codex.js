@@ -174,6 +174,7 @@ export class CodexAppServer extends EventEmitter {
       this.#captureThreadSettings(result);
       const parity = this.parityReport();
       if (!parity.effectiveVerified) return this.newThread();
+      await this.#injectTransportInstructions();
       await this.onThreadId(this.threadId);
       return this.threadId;
     } catch (error) {
@@ -201,18 +202,21 @@ export class CodexAppServer extends EventEmitter {
       ];
       throw new Error(`Codex config parity check failed: ${Array.from(new Set(failures)).join(", ")}`);
     }
-    if (this.transportInstructions) {
-      await this.request("thread/inject_items", {
-        threadId: this.threadId,
-        items: [{
-          type: "message",
-          role: "developer",
-          content: [{ type: "input_text", text: this.transportInstructions }],
-        }],
-      });
-    }
+    await this.#injectTransportInstructions();
     await this.onThreadId(this.threadId);
     return this.threadId;
+  }
+
+  async #injectTransportInstructions() {
+    if (!this.transportInstructions) return;
+    await this.request("thread/inject_items", {
+      threadId: this.threadId,
+      items: [{
+        type: "message",
+        role: "developer",
+        content: [{ type: "input_text", text: this.transportInstructions }],
+      }],
+    });
   }
 
   async startTurn(input) {

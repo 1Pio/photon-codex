@@ -6,6 +6,7 @@ import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import {
+  MANUAL_COMPLETION_REMINDER,
   Bridge,
   IMESSAGE_EDIT_WINDOW_MS,
   PROGRESS_EDIT_LIMIT,
@@ -19,6 +20,8 @@ import {
   snapshotFile,
   splitApprovalPrompt,
   splitMessage,
+  transportInstructions,
+  withCompletionReminder,
 } from "../src/bridge.js";
 import {
   CONTROL_PREFACE_LIMIT,
@@ -34,10 +37,12 @@ import {
   modelPerformanceDefaults,
 } from "../src/codex.js";
 import {
+  DEFAULT_AUTO_SEND_FINAL,
   DEFAULT_CODEX_OVERRIDES,
   emptyState,
   loadConfig,
   loadState,
+  normalizeAutoSendFinal,
   normalizeCodexOverrides,
   normalizeSender,
   normalizeState,
@@ -57,7 +62,7 @@ test("normalizes E.164 input without weakening validation", () => {
   assert.throws(() => normalizeSender("555-1234"));
 });
 
-test("persists only transport configuration and the three explicit Codex overrides", async () => {
+test("persists the final-delivery setting with transport configuration and the three Codex overrides", async () => {
   const home = await mkdtemp(path.join(os.tmpdir(), "photon-codex-config-"));
   const env = {
     PHOTON_CODEX_HOME: home,
@@ -69,6 +74,7 @@ test("persists only transport configuration and the three explicit Codex overrid
       projectId: "project",
       allowedSender: TEST_SENDER,
       cwd: path.join(home, "workspace"),
+      autoSendFinal: true,
       codexOverrides: {
         reasoningEffort: "extra high",
         fastMode: false,
@@ -78,7 +84,9 @@ test("persists only transport configuration and the three explicit Codex overrid
 
     const stored = JSON.parse(await readFile(path.join(home, "config.json"), "utf8"));
     const loaded = await loadConfig(env);
-    assert.deepEqual(Object.keys(stored).sort(), ["allowedSender", "codexOverrides", "cwd", "maxAttachmentBytes", "projectId"]);
+    assert.deepEqual(Object.keys(stored).sort(), ["allowedSender", "autoSendFinal", "codexOverrides", "cwd", "maxAttachmentBytes", "projectId"]);
+    assert.equal(stored.autoSendFinal, true);
+    assert.equal(loaded.autoSendFinal, true);
     assert.deepEqual(stored.codexOverrides, {
       reasoningEffort: "extra high",
       fastMode: false,
@@ -107,7 +115,8 @@ test("ignores legacy Codex overrides in Photon config", async () => {
     }));
 
     const loaded = await loadConfig(env);
-    assert.deepEqual(Object.keys(loaded).sort(), ["allowedSender", "codexOverrides", "cwd", "maxAttachmentBytes", "projectId"]);
+    assert.deepEqual(Object.keys(loaded).sort(), ["allowedSender", "autoSendFinal", "codexOverrides", "cwd", "maxAttachmentBytes", "projectId"]);
+    assert.equal(loaded.autoSendFinal, false);
     assert.deepEqual(loaded.codexOverrides, {});
   } finally {
     await rm(home, { recursive: true, force: true });
@@ -134,6 +143,11 @@ test("reloads the durable follow-up queue in FIFO order", async () => {
 });
 
 test("normalizes the complete public override vocabulary and validates the boundary", () => {
+  assert.equal(DEFAULT_AUTO_SEND_FINAL, false);
+  assert.equal(normalizeAutoSendFinal(), false);
+  assert.equal(normalizeAutoSendFinal(false), false);
+  assert.equal(normalizeAutoSendFinal(true), true);
+  assert.throws(() => normalizeAutoSendFinal("false"), /must be true or false/);
   assert.deepEqual(DEFAULT_CODEX_OVERRIDES, {
     reasoningEffort: "medium",
     fastMode: true,
@@ -157,6 +171,26 @@ test("normalizes the complete public override vocabulary and validates the bound
   assert.throws(() => normalizeCodexOverrides({ followUpMode: false }), /must be queue or steer/);
   assert.throws(() => normalizeCodexOverrides({ model: "gpt-5.6-sol" }), /unsupported field: model/);
   assert.throws(() => normalizeCodexOverrides([]), /must be an object/);
+});
+
+test("makes manual final delivery the explicit default transport contract", () => {
+  const manual = transportInstructions(false);
+  assert.match(manual, /Automatic final delivery is disabled/);
+  assert.match(manual, /No final answer, commentary, reasoning summary, tool call, tool output, or reaction directive/);
+  assert.match(manual, /end the Codex turn with exactly Answered/);
+  assert.match(manual, /Automatic progress-to-final editing is disabled/);
+
+  const automatic = transportInstructions(true);
+  assert.match(automatic, /delivers your final answer automatically/);
+  assert.match(automatic, /\[\[photon_reaction:EMOJI\]\]/);
+
+  const receipt = { messageId: "synthetic-message" };
+  assert.equal(withCompletionReminder(receipt, true), receipt);
+  assert.deepEqual(withCompletionReminder(receipt, false), {
+    messageId: "synthetic-message",
+    autoSendFinal: false,
+    completionReminder: MANUAL_COMPLETION_REMINDER,
+  });
 });
 
 test("uses only app-server process overrides for the three supported settings", () => {
@@ -632,7 +666,7 @@ test("tracks one active progress bubble, reserves edit five, and edits a plain f
       stopTyping: async () => {},
     };
     const bridge = new Bridge({
-      config: { projectId: "project", allowedSender: TEST_SENDER, cwd: home, maxAttachmentBytes: 1024 },
+      config: { projectId: "project", allowedSender: TEST_SENDER, cwd: home, maxAttachmentBytes: 1024, autoSendFinal: true },
       projectSecret: "secret",
       env: { ...process.env, PHOTON_CODEX_HOME: home },
       logger: async (level, event, details) => events.push({ level, event, details }),
@@ -674,6 +708,76 @@ test("tracks one active progress bubble, reserves edit five, and edits a plain f
     assert.equal(bridge.deliveryByTurn.size, 0);
     assert.deepEqual(bridge.state.repliedMessageIds, ["inbound-1"]);
     assert.equal(events.filter(({ event }) => event === "message_edited").at(-1).details.phase, "final_answer");
+  } finally {
+    await rm(home, { recursive: true, force: true });
+  }
+});
+
+test("manual mode permits an explicit fifth edit and suppresses every automatic final output", async () => {
+  const home = await mkdtemp(path.join(os.tmpdir(), "photon-codex-manual-final-"));
+  const edits = [];
+  const replies = [];
+  const reactions = [];
+  const events = [];
+  try {
+    const progressMessage = {
+      id: "manual-progress",
+      direction: "outbound",
+      timestamp: new Date(),
+      content: { type: "text", text: "Starting" },
+      edit: async (builder) => { edits.push(await builder.build()); },
+    };
+    const space = {
+      id: "space-1",
+      send: async () => progressMessage,
+      stopTyping: async () => {},
+    };
+    const bridge = new Bridge({
+      config: { projectId: "project", allowedSender: TEST_SENDER, cwd: home, maxAttachmentBytes: 1024, autoSendFinal: false },
+      projectSecret: "secret",
+      env: { ...process.env, PHOTON_CODEX_HOME: home },
+      logger: async (level, event, details) => events.push({ level, event, details }),
+    });
+    bridge.state = { ...emptyState(), spaceId: "space-1" };
+    bridge.space = space;
+    bridge.activeTurnId = "manual-turn";
+    bridge.targetByTurn.set("manual-turn", {
+      id: "manual-inbound",
+      react: async (emoji) => { reactions.push(emoji); return { id: "reaction" }; },
+      reply: async (content) => { replies.push(await content.build()); return { id: "reply" }; },
+      space,
+    });
+
+    await bridge.sendProgress({ text: "Starting" });
+    let receipt;
+    for (let index = 1; index <= 5; index += 1) {
+      receipt = await bridge.editMessage({ messageId: "manual-progress", text: `Manual ${index}` });
+    }
+    assert.equal(receipt.observedEdits, 5);
+    assert.equal(receipt.remainingProgressEdits, 0);
+    assert.equal(receipt.finalEditReserved, false);
+    assert.match(receipt.warning, /fifth and final edit/);
+    await assert.rejects(
+      () => bridge.editMessage({ messageId: "manual-progress", text: "Too late" }),
+      /fifth and final iMessage edit is already used/,
+    );
+
+    for (const phase of ["commentary", "final_answer"]) {
+      await bridge.handleCodexNotification("item/completed", {
+        turnId: "manual-turn",
+        item: { type: "agentMessage", phase, text: "[[photon_reaction:🫡]] hidden output" },
+      });
+    }
+    await bridge.handleCodexNotification("turn/completed", {
+      turn: { id: "manual-turn", status: "completed", items: [{ type: "agentMessage", text: "hidden fallback" }] },
+    });
+
+    assert.equal(edits.length, 5);
+    assert.deepEqual(replies, []);
+    assert.deepEqual(reactions, []);
+    assert.deepEqual(bridge.state.repliedMessageIds, []);
+    assert.equal(bridge.deliveryByTurn.size, 0);
+    assert.equal(events.filter(({ event }) => event === "final_suppressed").length, 1);
   } finally {
     await rm(home, { recursive: true, force: true });
   }
@@ -735,7 +839,7 @@ test("falls back to the normal final path when a progress edit fails", async () 
     };
     const space = { id: "space-1", send: async () => sent, stopTyping: async () => {} };
     const bridge = new Bridge({
-      config: { projectId: "project", allowedSender: TEST_SENDER, cwd: home, maxAttachmentBytes: 1024 },
+      config: { projectId: "project", allowedSender: TEST_SENDER, cwd: home, maxAttachmentBytes: 1024, autoSendFinal: true },
       projectSecret: "secret",
       env: { ...process.env, PHOTON_CODEX_HOME: home },
       logger: async (level, event, details) => events.push({ level, event, details }),
@@ -786,7 +890,7 @@ test("rich, file-bearing, and expired progress finals bypass editing", async (t)
         };
         const space = { id: "space-1", send: async () => sent, stopTyping: async () => {} };
         const bridge = new Bridge({
-          config: { projectId: "project", allowedSender: TEST_SENDER, cwd: home, maxAttachmentBytes: 1024 },
+          config: { projectId: "project", allowedSender: TEST_SENDER, cwd: home, maxAttachmentBytes: 1024, autoSendFinal: true },
           projectSecret: "secret",
           env: { ...process.env, PHOTON_CODEX_HOME: home },
           logger: async () => {},
@@ -869,7 +973,7 @@ test("sends a complete Unicode stack in order and marks the active turn delivere
       stopTyping: async () => {},
     };
     const bridge = new Bridge({
-      config: { projectId: "project", allowedSender: TEST_SENDER, cwd: home, maxAttachmentBytes: 1024 },
+      config: { projectId: "project", allowedSender: TEST_SENDER, cwd: home, maxAttachmentBytes: 1024, autoSendFinal: true },
       projectSecret: "secret",
       env: { ...process.env, PHOTON_CODEX_HOME: home },
       logger: async () => {},
@@ -916,7 +1020,7 @@ test("a complete stack remains the delivered answer when Codex emits no final te
       stopTyping: async () => {},
     };
     const bridge = new Bridge({
-      config: { projectId: "project", allowedSender: TEST_SENDER, cwd: home, maxAttachmentBytes: 1024 },
+      config: { projectId: "project", allowedSender: TEST_SENDER, cwd: home, maxAttachmentBytes: 1024, autoSendFinal: true },
       projectSecret: "secret",
       env: { ...process.env, PHOTON_CODEX_HOME: home },
       logger: async () => {},
@@ -959,7 +1063,7 @@ test("reports stack partial delivery exactly and never retries a sent bubble", a
       stopTyping: async () => {},
     };
     const bridge = new Bridge({
-      config: { projectId: "project", allowedSender: TEST_SENDER, cwd: home, maxAttachmentBytes: 1024 },
+      config: { projectId: "project", allowedSender: TEST_SENDER, cwd: home, maxAttachmentBytes: 1024, autoSendFinal: true },
       projectSecret: "secret",
       env: { ...process.env, PHOTON_CODEX_HOME: home },
       logger: async () => {},
@@ -1055,6 +1159,7 @@ test("accepts one user message and records one successful reply", async () => {
         allowedSender: TEST_SENDER,
         cwd: home,
         maxAttachmentBytes: 1024,
+        autoSendFinal: true,
       },
       projectSecret: "secret",
       env: { ...process.env, PHOTON_CODEX_HOME: home },
@@ -1112,7 +1217,7 @@ test("a failed reaction never suppresses the answer text", async () => {
   let attempts = 0;
   try {
     const bridge = new Bridge({
-      config: { projectId: "project", allowedSender: TEST_SENDER, cwd: home, maxAttachmentBytes: 1024 },
+      config: { projectId: "project", allowedSender: TEST_SENDER, cwd: home, maxAttachmentBytes: 1024, autoSendFinal: true },
       projectSecret: "secret",
       env: { ...process.env, PHOTON_CODEX_HOME: home },
       logger: async (level, event) => events.push({ level, event }),
@@ -1147,7 +1252,7 @@ test("a commentary reaction is sent once before the final answer", async () => {
   const replies = [];
   try {
     const bridge = new Bridge({
-      config: { projectId: "project", allowedSender: TEST_SENDER, cwd: home, maxAttachmentBytes: 1024 },
+      config: { projectId: "project", allowedSender: TEST_SENDER, cwd: home, maxAttachmentBytes: 1024, autoSendFinal: true },
       projectSecret: "secret",
       env: { ...process.env, PHOTON_CODEX_HOME: home },
       logger: async () => {},
@@ -1189,7 +1294,7 @@ test("a failed reaction-only response falls back to visible emoji text", async (
   let fallback;
   try {
     const bridge = new Bridge({
-      config: { projectId: "project", allowedSender: TEST_SENDER, cwd: home, maxAttachmentBytes: 1024 },
+      config: { projectId: "project", allowedSender: TEST_SENDER, cwd: home, maxAttachmentBytes: 1024, autoSendFinal: true },
       projectSecret: "secret",
       env: { ...process.env, PHOTON_CODEX_HOME: home },
       logger: async () => {},
@@ -1449,6 +1554,8 @@ test("status reports native Codex config parity without Photon overrides", () =>
   assert.deepEqual(status.configParity.overrides, []);
   assert.equal(status.account.type, "chatgpt");
   assert.equal(status.pendingCodexRequests, 0);
+  assert.equal(status.autoSendFinal, false);
+  assert.equal(status.finalDelivery, "manual");
 });
 
 test("migrates legacy state and starts a fresh native-config thread", () => {
@@ -1741,6 +1848,25 @@ test("resumes persisted threads with app-server-resolved native performance valu
     config: { model_reasoning_effort: "xhigh" },
   });
   assert.equal(codex.parityReport().verified, true);
+});
+
+test("reinjects the current transport contract when a persisted thread resumes", async () => {
+  const codex = configuredCodex({
+    threadId: "thread-1",
+    transportInstructions: "manual final contract",
+  });
+  const requests = [];
+  codex.request = async (method, params) => {
+    requests.push({ method, params });
+    return method === "thread/resume" ? inheritedThread("thread-1") : {};
+  };
+
+  await codex.ensureThread();
+
+  assert.deepEqual(requests.map(({ method }) => method), ["thread/resume", "thread/inject_items"]);
+  assert.equal(requests[1].params.threadId, "thread-1");
+  assert.equal(requests[1].params.items[0].role, "developer");
+  assert.equal(requests[1].params.items[0].content[0].text, "manual final contract");
 });
 
 test("omitted reasoning override resumes with the current native model default, not stale metadata", async () => {

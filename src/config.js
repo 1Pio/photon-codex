@@ -20,6 +20,7 @@ export const DEFAULT_CODEX_OVERRIDES = Object.freeze({
   fastMode: true,
   followUpMode: "steer",
 });
+export const DEFAULT_AUTO_SEND_FINAL = false;
 
 export function appHome(env = process.env) {
   return path.resolve(env.PHOTON_CODEX_HOME || path.join(os.homedir(), ".config", "photon-codex"));
@@ -85,6 +86,7 @@ export async function loadConfig(env = process.env) {
     allowedSender: env.PHOTON_CODEX_ALLOWED_SENDER || stored.allowedSender,
     cwd: path.resolve(env.PHOTON_CODEX_CWD || stored.cwd || workspacePath(env)),
     maxAttachmentBytes: Number(env.PHOTON_CODEX_MAX_ATTACHMENT_BYTES || stored.maxAttachmentBytes || 50 * 1024 * 1024),
+    autoSendFinal: normalizeAutoSendFinal(stored.autoSendFinal),
     codexOverrides: normalizeCodexOverrides(stored.codexOverrides),
   };
   if (!config.projectId) throw new Error("Photon project ID is missing. Run `photon-codex init`.");
@@ -108,6 +110,7 @@ export async function saveConfig(config, env = process.env) {
     allowedSender: normalizeSender(config.allowedSender),
     cwd: path.resolve(config.cwd),
     maxAttachmentBytes: Number(config.maxAttachmentBytes || 50 * 1024 * 1024),
+    autoSendFinal: normalizeAutoSendFinal(config.autoSendFinal),
     ...(Object.keys(codexOverrides).length ? { codexOverrides: serializeCodexOverrides(codexOverrides) } : {}),
   };
   if (!value.projectId) throw new Error("projectId is required");
@@ -229,8 +232,15 @@ export function redactConfig(config) {
     allowedSender: `${config.allowedSender.slice(0, 4)}…${config.allowedSender.slice(-3)}`,
     cwd: config.cwd,
     maxAttachmentBytes: config.maxAttachmentBytes,
+    autoSendFinal: config.autoSendFinal,
     codexOverrides: config.codexOverrides || {},
   };
+}
+
+export function normalizeAutoSendFinal(value) {
+  if (value === undefined) return DEFAULT_AUTO_SEND_FINAL;
+  if (typeof value !== "boolean") throw new Error("autoSendFinal must be true or false");
+  return value;
 }
 
 export function normalizeCodexOverrides(value) {

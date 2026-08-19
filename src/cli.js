@@ -9,6 +9,7 @@ import { Bridge, snapshotFile } from "./bridge.js";
 import { controlRequest } from "./control.js";
 import { CodexAppServer, codexExecutable, codexHome } from "./codex.js";
 import {
+  DEFAULT_AUTO_SEND_FINAL,
   DEFAULT_CODEX_OVERRIDES,
   loadConfig,
   loadState,
@@ -38,7 +39,7 @@ try {
   else if (command === "auth" && args[0] === "set") await authSet();
   else if (command === "run") await run();
   else if (command === "doctor") await doctor();
-  else if (command === "status") print({ ...(await control("status")), service: serviceStatus() });
+  else if (command === "status") print({ ...(await statusResult()), service: serviceStatus() });
   else if (command === "stop") print(await control("stop"));
   else if (command === "send") print(await control("send", { text: args.join(" ") }));
   else if (command === "send-stack") await sendStack(args);
@@ -54,7 +55,7 @@ try {
   else if (command === "service" && args[0] === "start") print(await startService());
   else if (command === "service" && args[0] === "stop") print(stopService());
   else if (command === "service" && args[0] === "restart") print(restartService());
-  else if (command === "service" && args[0] === "status") print({ ...serviceStatus(), bridge: await control("status") });
+  else if (command === "service" && args[0] === "status") print({ ...serviceStatus(), bridge: await statusResult() });
   else if (command === "service" && args[0] === "uninstall") print(await uninstallService());
   else help(command === "help" || command === "--help" || command === "-h" ? 0 : 1);
 } catch (error) {
@@ -81,6 +82,7 @@ async function init(args) {
       projectId,
       allowedSender,
       cwd: path.resolve(cwd),
+      autoSendFinal: DEFAULT_AUTO_SEND_FINAL,
       codexOverrides: DEFAULT_CODEX_OVERRIDES,
     });
     print({ configured: true, config: redactConfig(config) });
@@ -277,6 +279,19 @@ async function sendStack(messages) {
   if (!result.complete) process.exitCode = 1;
 }
 
+async function statusResult() {
+  const configured = (await loadConfig()).autoSendFinal;
+  const status = await control("status");
+  const effective = status.running ? status.autoSendFinal : configured;
+  return {
+    ...status,
+    autoSendFinal: effective,
+    finalDelivery: effective ? "automatic" : "manual",
+    configuredAutoSendFinal: configured,
+    restartRequired: status.running && status.autoSendFinal !== configured,
+  };
+}
+
 async function serviceInstall() {
   const result = await doctorResult();
   if (!result.ok) throw new Error(`preflight failed: ${result.checks.filter((check) => !check.ok).map((check) => check.check).join(", ")}`);
@@ -383,6 +398,8 @@ function help(exitCode) {
   workspace set PATH
   logs [COUNT]
   service install|start|stop|restart|status|uninstall
+
+Automatic final delivery is off by default. Delivery commands remind Codex to send every visible part, then finish with only Answered.
 `);
   process.exitCode = exitCode;
 }
