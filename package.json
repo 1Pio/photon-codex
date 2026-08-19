@@ -8,8 +8,7 @@
     "src",
     ".env.example",
     "LICENSE",
-    "README.md",
-    "SECURITY.md"
+    "README.md"
   ],
   "bin": {
     "photon-codex": "src/cli.js"
