@@ -24,12 +24,15 @@ import {
   modelPerformanceDefaults,
 } from "../src/codex.js";
 import {
+  DEFAULT_CODEX_OVERRIDES,
   emptyState,
   loadConfig,
+  loadState,
   normalizeCodexOverrides,
   normalizeSender,
   normalizeState,
   saveConfig,
+  saveState,
 } from "../src/config.js";
 import { formatServerRequest, resolveServerRequest, supportsServerRequest } from "../src/interaction.js";
 import { launchAgentPlist } from "../src/service.js";
@@ -40,7 +43,7 @@ test("normalizes E.164 input without weakening validation", () => {
   assert.throws(() => normalizeSender("555-1234"));
 });
 
-test("persists only transport configuration and the two explicit Codex overrides", async () => {
+test("persists only transport configuration and the three explicit Codex overrides", async () => {
   const home = await mkdtemp(path.join(os.tmpdir(), "photon-codex-config-"));
   const env = {
     PHOTON_CODEX_HOME: home,
@@ -55,14 +58,23 @@ test("persists only transport configuration and the two explicit Codex overrides
       codexOverrides: {
         reasoningEffort: "extra high",
         fastMode: false,
+        followUpMode: "steer",
       },
     }, env);
 
     const stored = JSON.parse(await readFile(path.join(home, "config.json"), "utf8"));
     const loaded = await loadConfig(env);
     assert.deepEqual(Object.keys(stored).sort(), ["allowedSender", "codexOverrides", "cwd", "maxAttachmentBytes", "projectId"]);
-    assert.deepEqual(stored.codexOverrides, { reasoningEffort: "extra high", fastMode: false });
-    assert.deepEqual(loaded.codexOverrides, { reasoningEffort: "xhigh", fastMode: false });
+    assert.deepEqual(stored.codexOverrides, {
+      reasoningEffort: "extra high",
+      fastMode: false,
+      followUpMode: "steer",
+    });
+    assert.deepEqual(loaded.codexOverrides, {
+      reasoningEffort: "xhigh",
+      fastMode: false,
+      followUpMode: "steer",
+    });
   } finally {
     await rm(home, { recursive: true, force: true });
   }
@@ -88,24 +100,52 @@ test("ignores legacy Codex overrides in Photon config", async () => {
   }
 });
 
-test("normalizes the complete public reasoning vocabulary and validates the override boundary", () => {
+test("reloads the durable follow-up queue in FIFO order", async () => {
+  const home = await mkdtemp(path.join(os.tmpdir(), "photon-codex-queue-state-"));
+  const env = { PHOTON_CODEX_HOME: home };
+  try {
+    const state = emptyState();
+    state.messageQueue = [
+      { messageId: "message-1", input: [{ type: "text", text: "first" }] },
+      { messageId: "message-2", input: [{ type: "text", text: "second" }] },
+    ];
+    await saveState(state, env);
+
+    const loaded = await loadState(env);
+
+    assert.deepEqual(loaded.messageQueue, state.messageQueue);
+  } finally {
+    await rm(home, { recursive: true, force: true });
+  }
+});
+
+test("normalizes the complete public override vocabulary and validates the boundary", () => {
+  assert.deepEqual(DEFAULT_CODEX_OVERRIDES, {
+    reasoningEffort: "medium",
+    fastMode: true,
+    followUpMode: "steer",
+  });
   assert.deepEqual(normalizeCodexOverrides(), {});
   assert.deepEqual(normalizeCodexOverrides({ reasoningEffort: "light" }), { reasoningEffort: "low" });
   assert.deepEqual(normalizeCodexOverrides({ reasoningEffort: "medium" }), { reasoningEffort: "medium" });
   assert.deepEqual(normalizeCodexOverrides({ reasoningEffort: "high" }), { reasoningEffort: "high" });
   assert.deepEqual(normalizeCodexOverrides({ reasoningEffort: " Extra   High " }), { reasoningEffort: "xhigh" });
-  assert.deepEqual(normalizeCodexOverrides({ reasoningEffort: "max", fastMode: true }), {
+  assert.deepEqual(normalizeCodexOverrides({ reasoningEffort: "max", fastMode: true, followUpMode: " Steer " }), {
     reasoningEffort: "max",
     fastMode: true,
+    followUpMode: "steer",
   });
   assert.deepEqual(normalizeCodexOverrides({ fastMode: false }), { fastMode: false });
+  assert.deepEqual(normalizeCodexOverrides({ followUpMode: "QUEUE" }), { followUpMode: "queue" });
   assert.throws(() => normalizeCodexOverrides({ reasoningEffort: "minimal" }), /light, medium, high, extra high, or max/);
   assert.throws(() => normalizeCodexOverrides({ fastMode: "false" }), /must be true or false/);
+  assert.throws(() => normalizeCodexOverrides({ followUpMode: "interrupt" }), /must be queue or steer/);
+  assert.throws(() => normalizeCodexOverrides({ followUpMode: false }), /must be queue or steer/);
   assert.throws(() => normalizeCodexOverrides({ model: "gpt-5.6-sol" }), /unsupported field: model/);
   assert.throws(() => normalizeCodexOverrides([]), /must be an object/);
 });
 
-test("uses only app-server process overrides for performance settings", () => {
+test("uses only app-server process overrides for the three supported settings", () => {
   assert.deepEqual(codexAppServerArgs(), ["app-server", "--listen", "stdio://"]);
   assert.deepEqual(codexAppServerArgs({ reasoningEffort: "xhigh" }), [
     "app-server", "--listen", "stdio://", "--config", "model_reasoning_effort=\"xhigh\"",
@@ -118,8 +158,19 @@ test("uses only app-server process overrides for performance settings", () => {
     "--config", "model_reasoning_effort=\"max\"",
     "--config", "service_tier=\"fast\"",
   ]);
+  assert.deepEqual(codexAppServerArgs({ followUpMode: "steer" }), [
+    "app-server", "--listen", "stdio://",
+    "--config", "desktop.followUpQueueMode=\"steer\"",
+  ]);
+  assert.deepEqual(codexAppServerArgs({ reasoningEffort: "medium", fastMode: true, followUpMode: "queue" }), [
+    "app-server", "--listen", "stdio://",
+    "--config", "model_reasoning_effort=\"medium\"",
+    "--config", "service_tier=\"fast\"",
+    "--config", "desktop.followUpQueueMode=\"queue\"",
+  ]);
   assert.throws(() => codexAppServerArgs({ reasoningEffort: "extra high" }), /Invalid native/);
   assert.throws(() => codexAppServerArgs({ fastMode: 1 }), /Invalid Codex fast mode/);
+  assert.throws(() => codexAppServerArgs({ followUpMode: "interrupt" }), /Invalid Codex follow-up mode/);
 });
 
 test("never borrows performance defaults from an unrelated catalog model", () => {
@@ -694,7 +745,7 @@ test("honors the Codex desktop follow-up queue setting", async () => {
     bridge.state = { ...emptyState(), spaceId: "space-1" };
     bridge.activeTurnId = "turn-active";
     bridge.codex = {
-      configSummary: () => ({ followUpQueueMode: "queue" }),
+      followUpMode: () => "queue",
       steer: async () => { steered += 1; },
       startTurn: async (input) => {
         started.push(input);
@@ -730,6 +781,55 @@ test("honors the Codex desktop follow-up queue setting", async () => {
 
     assert.equal(started.length, 1);
     assert.equal(bridge.activeTurnId, "turn-next");
+    assert.deepEqual(bridge.state.messageQueue, []);
+  } finally {
+    await rm(home, { recursive: true, force: true });
+  }
+});
+
+test("steers an active Codex turn when the effective follow-up mode is steer", async () => {
+  const home = await mkdtemp(path.join(os.tmpdir(), "photon-codex-steer-"));
+  try {
+    const steered = [];
+    const bridge = new Bridge({
+      config: {
+        projectId: "project",
+        allowedSender: "+15551234567",
+        cwd: home,
+        maxAttachmentBytes: 1024,
+      },
+      projectSecret: "secret",
+      env: { ...process.env, PHOTON_CODEX_HOME: home },
+      logger: async () => {},
+    });
+    bridge.state = { ...emptyState(), spaceId: "space-1" };
+    bridge.activeTurnId = "turn-active";
+    bridge.codex = {
+      followUpMode: () => "steer",
+      steer: async (turnId, input) => { steered.push({ turnId, input }); },
+    };
+    const space = {
+      id: "space-1",
+      type: "dm",
+      startTyping: async () => {},
+      stopTyping: async () => {},
+    };
+    const message = {
+      id: "message-steered",
+      direction: "inbound",
+      sender: { id: "+15551234567" },
+      timestamp: new Date("2026-08-19T00:00:00.000Z"),
+      content: { type: "text", text: "adjust the active turn" },
+      read: async () => {},
+      space,
+    };
+
+    await bridge.handleMessage(space, message);
+
+    assert.equal(steered.length, 1);
+    assert.equal(steered[0].turnId, "turn-active");
+    assert.equal(steered[0].input[0].text, "adjust the active turn");
+    assert.deepEqual(bridge.state.acceptedMessageIds, ["message-steered"]);
     assert.deepEqual(bridge.state.messageQueue, []);
   } finally {
     await rm(home, { recursive: true, force: true });
@@ -920,6 +1020,78 @@ test("fastMode false explicitly verifies the default service tier", async () => 
   assert.equal(codex.parityReport().effectiveVerified, true);
 });
 
+test("reports inherited, defaulted, and overridden follow-up modes truthfully", async () => {
+  const defaulted = configuredCodex();
+  defaulted.request = async () => inheritedThread("thread-default-steer");
+  await defaulted.newThread();
+  assert.deepEqual(defaulted.parityReport().followUpMode, {
+    source: "native",
+    configured: null,
+    effective: "steer",
+    configValue: null,
+    verified: true,
+  });
+  assert.equal(defaulted.followUpMode(), "steer");
+
+  const inherited = configuredCodex();
+  inherited.effectiveConfig.desktop = { followUpQueueMode: "queue" };
+  inherited.request = async () => inheritedThread("thread-native-queue");
+  await inherited.newThread();
+  assert.deepEqual(inherited.parityReport().followUpMode, {
+    source: "native",
+    configured: null,
+    effective: "queue",
+    configValue: "queue",
+    verified: true,
+  });
+  assert.equal(inherited.followUpMode(), "queue");
+
+  const legacy = configuredCodex();
+  legacy.effectiveConfig.desktop = { followUpQueueMode: "interrupt" };
+  legacy.request = async () => inheritedThread("thread-native-interrupt");
+  await legacy.newThread();
+  assert.deepEqual(legacy.parityReport().followUpMode, {
+    source: "native",
+    configured: null,
+    effective: "steer",
+    configValue: "interrupt",
+    verified: true,
+  });
+
+  const overridden = configuredCodex({ codexOverrides: { followUpMode: "steer" } });
+  overridden.effectiveConfig.desktop = { followUpQueueMode: "steer" };
+  overridden.request = async () => inheritedThread("thread-override-steer");
+  await overridden.newThread();
+  assert.deepEqual(overridden.parityReport().overrides, ["followUpMode"]);
+  assert.deepEqual(overridden.parityReport().followUpMode, {
+    source: "override",
+    configured: "steer",
+    effective: "steer",
+    configValue: "steer",
+    verified: true,
+  });
+});
+
+test("fails parity when app-server does not apply a follow-up mode override", async () => {
+  const codex = configuredCodex({ codexOverrides: { followUpMode: "steer" } });
+  codex.effectiveConfig.desktop = { followUpQueueMode: "queue" };
+  codex.request = async () => inheritedThread("thread-follow-up-mismatch");
+
+  await assert.rejects(() => codex.newThread(), /followUpMode unverified/);
+  assert.equal(codex.parityReport().effectiveVerified, false);
+  assert.equal(codex.parityReport().followUpMode.verified, false);
+});
+
+test("fails parity closed for an unsupported inherited follow-up mode", async () => {
+  const codex = configuredCodex();
+  codex.effectiveConfig.desktop = { followUpQueueMode: "future-mode" };
+  codex.request = async () => inheritedThread("thread-unsupported-follow-up");
+
+  await assert.rejects(() => codex.newThread(), /followUpMode unverified/);
+  assert.equal(codex.followUpMode(), null);
+  assert.equal(codex.parityReport().followUpMode.verified, false);
+});
+
 test("persists a new Codex thread immediately so restart cannot rotate it", async () => {
   const saved = [];
   const codex = configuredCodex({ onThreadId: async (id) => saved.push(id) });
@@ -1051,10 +1223,10 @@ test("changed performance overrides replace an incompatible resumed thread", asy
   assert.equal(codex.parityReport().effectiveVerified, true);
 });
 
-test("steering never carries or mutates performance overrides", async () => {
+test("steering never carries or mutates process overrides", async () => {
   const codex = configuredCodex({
     threadId: "thread-1",
-    codexOverrides: { reasoningEffort: "max", fastMode: false },
+    codexOverrides: { reasoningEffort: "max", fastMode: false, followUpMode: "steer" },
   });
   let request;
   codex.request = async (method, params) => {

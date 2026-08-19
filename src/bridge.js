@@ -215,7 +215,7 @@ export class Bridge {
         return;
       }
       if (this.activeTurnId) {
-        if (this.codex.configSummary().followUpQueueMode === "queue") {
+        if (this.codex.followUpMode() === "queue") {
           await this.#enqueueMessage(input, message, disposition.contentType);
           return;
         } else {

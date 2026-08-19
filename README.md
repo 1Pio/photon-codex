@@ -10,7 +10,7 @@ It is deliberately one process and one runtime dependency surface. Photon stream
 - Images as native Codex `localImage` inputs
 - Other attachments as private local files that Codex can inspect
 - Persistent Codex thread resumption
-- Native Codex config inheritance, with optional reasoning-effort and fast-mode overrides only
+- Native Codex config inheritance, with three optional Codex overrides only
 - iMessage handling for Codex approvals, permission requests, user questions, and app forms
 - Crash-safe FIFO follow-up queuing or active-turn steering, matching Codex's configured queue mode
 - Direct-message and exact-sender isolation
@@ -46,7 +46,7 @@ photon-codex service install
 
 Configuration, private attachments, a bounded operational log, and small runtime state live under `~/.config/photon-codex/` by default. Set `PHOTON_CODEX_HOME` to change that location. New installations use `~/.config/photon-codex/workspace` as a neutral private Codex workspace, so unrelated tasks cannot dirty the bridge source repository. Choose another workspace during `init` or later with `photon-codex workspace set PATH`.
 
-`config.json` contains Photon transport settings and may contain one narrow Codex performance overlay:
+`config.json` contains Photon transport settings and may contain one narrow Codex overlay. New `photon-codex init` configurations use medium reasoning, fast mode, and steering by default:
 
 ```json
 {
@@ -55,19 +55,20 @@ Configuration, private attachments, a bounded operational log, and small runtime
   "cwd": "/path/to/your/workspace",
   "maxAttachmentBytes": 52428800,
   "codexOverrides": {
-    "reasoningEffort": "extra high",
-    "fastMode": true
+    "reasoningEffort": "medium",
+    "fastMode": true,
+    "followUpMode": "steer"
   }
 }
 ```
 
-`codexOverrides` is optional, and either field may be omitted independently. Omitted fields inherit the effective native Codex configuration. `reasoningEffort` accepts only `light`, `medium`, `high`, `extra high`, or `max`; these map to Codex's native `low`, `medium`, `high`, `xhigh`, and `max` values. `fastMode: true` selects Codex's `fast` service tier, which the provider reports as `priority`. `fastMode: false` explicitly selects the default non-priority tier.
+`codexOverrides` is optional, and every field may be omitted independently to inherit the effective native Codex configuration. `reasoningEffort` accepts only `light`, `medium`, `high`, `extra high`, or `max`; these map to Codex's native `low`, `medium`, `high`, `xhigh`, and `max` values. `fastMode: true` selects Codex's `fast` service tier, which the provider reports as `priority`. `fastMode: false` explicitly selects the default non-priority tier. `followUpMode` accepts only `queue` or `steer`. Queue holds a new iMessage until the active turn completes; steer appends it to that active turn through `turn/steer`.
 
-No other Codex setting can be overridden here. App-server still resolves the normal Codex layers from `$CODEX_HOME/config.toml` and trusted project `.codex/config.toml` files for `cwd`, exactly as Codex does in its other local clients. photon-codex passes the two validated values through app-server's supported process-level `--config` mechanism, then supplies those same app-server-resolved values when starting or resuming a thread so stale rollout metadata cannot win. The same effective values therefore apply to new threads, resumed threads, restarts, and every later turn. The running process never reloads this file mid-turn, and `turn/steer` carries no settings, so an active steered turn is not mutated. Restart the service after changing the overlay. On macOS, photon-codex prefers the Codex executable bundled with the installed ChatGPT desktop app so its protocol and feature version match the app; set `PHOTON_CODEX_BIN` only when you deliberately want another executable.
+No other Codex setting can be overridden here. App-server still resolves the normal Codex layers from `$CODEX_HOME/config.toml` and trusted project `.codex/config.toml` files for `cwd`, exactly as Codex does in its other local clients. photon-codex passes only the three validated fields through app-server's supported process-level `--config` mechanism. It supplies the app-server-resolved performance values again when starting or resuming a thread so stale rollout metadata cannot win, and reads the effective follow-up mode from the same native `config/read` result that drives bridge routing. The values therefore remain effective across new threads, resumed threads, restarts, and later turns. The running process never reloads this file mid-turn, and `turn/steer` carries no settings, so an already-running turn is not reconfigured. Restart the service after changing the overlay. On macOS, photon-codex prefers the Codex executable bundled with the installed ChatGPT desktop app so its protocol and feature version match the app; set `PHOTON_CODEX_BIN` only when you deliberately want another executable.
 
 Photon credentials and project identifiers are removed from the Codex child environment. The only Photon-specific value retained is the non-secret `PHOTON_CODEX_HOME` locator when configured, so an agent's `photon-codex send-file` and reaction commands reach the same local bridge.
 
-Run `photon-codex doctor` after changing native Codex configuration or `codexOverrides`, then `photon-codex service restart`. Doctor launches an ephemeral app-server thread, reads the resolved effective config through the native `config/read` API, and compares every corresponding field reported by the thread, including model, reasoning effort, service tier, approval policy, reviewer, sandbox network policy, and workspace. Its `performance` report marks each setting as `native` or `override`, shows the configured and effective values, and verifies them against the thread. `photon-codex status` exposes the same report for the live persistent thread. Legacy top-level `reasoningEffort` and `fastMode` fields remain ignored; only the nested two-field object is recognized.
+Run `photon-codex doctor` after changing native Codex configuration or `codexOverrides`, then `photon-codex service restart`. Doctor launches an ephemeral app-server thread, reads the resolved effective config through the native `config/read` API, and compares every corresponding field reported by the thread, including model, reasoning effort, service tier, approval policy, reviewer, sandbox network policy, and workspace. Its `performance` and `followUpMode` reports mark each setting as `native` or `override`, show configured and effective values, and verify the actual app-server result. `photon-codex status` exposes the same report for the live persistent thread. Legacy top-level `reasoningEffort`, `fastMode`, and follow-up fields remain ignored; only the three-field nested object is recognized.
 
 `state.json` contains the persistent Codex thread, bound conversation, bounded accepted/replied/ignored event IDs, truthful counters, and the current loopback control endpoint. The Photon secret is not stored in either file or in the service definition.
 
@@ -122,6 +123,6 @@ npm run test:live
 npm run doctor
 ```
 
-`npm run test:live` uses the installed, authenticated Codex app-server. It checks native inheritance, each partial overlay, the combined overlay, explicit fast-mode disable, effective-value reporting, restart/resume of the same persisted thread, and a subsequent live turn. Its temporary persistent thread is archived when the test finishes.
+`npm run test:live` uses the installed, authenticated Codex app-server. It checks native inheritance, every partial overlay, both follow-up modes, the combined overlay, explicit fast-mode disable, effective-value reporting, restart/resume of the same persisted thread, and a subsequent live turn. Its temporary persistent thread is archived when the test finishes.
 
 Codex app-server is the official open-source embedding interface used for threads, turns, approvals, history, and streamed agent events. See the [Codex app-server documentation](https://learn.chatgpt.com/docs/app-server) and [openai/codex source](https://github.com/openai/codex/tree/main/codex-rs/app-server). The media implementation follows Photon's documented [Spectrum reactions and replies](https://photon.codes/docs/spectrum-ts/reactions-and-replies) and [Advanced iMessage attachment](https://github.com/photon-hq/advanced-imessage-ts#send-attachments) contracts.

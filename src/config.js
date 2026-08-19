@@ -12,6 +12,13 @@ const REASONING_EFFORTS = new Map([
   ["max", "max"],
 ]);
 const DISPLAY_REASONING_EFFORTS = new Map(Array.from(REASONING_EFFORTS, ([display, native]) => [native, display]));
+const FOLLOW_UP_MODES = new Set(["queue", "steer"]);
+
+export const DEFAULT_CODEX_OVERRIDES = Object.freeze({
+  reasoningEffort: "medium",
+  fastMode: true,
+  followUpMode: "steer",
+});
 
 export function appHome(env = process.env) {
   return path.resolve(env.PHOTON_CODEX_HOME || path.join(os.homedir(), ".config", "photon-codex"));
@@ -229,7 +236,7 @@ export function normalizeCodexOverrides(value) {
   if (!value || typeof value !== "object" || Array.isArray(value)) {
     throw new Error("codexOverrides must be an object");
   }
-  const unknown = Object.keys(value).filter((key) => !["reasoningEffort", "fastMode"].includes(key));
+  const unknown = Object.keys(value).filter((key) => !["reasoningEffort", "fastMode", "followUpMode"].includes(key));
   if (unknown.length) throw new Error(`codexOverrides contains unsupported field: ${unknown.join(", ")}`);
   const overrides = {};
   if (Object.hasOwn(value, "reasoningEffort")) {
@@ -246,6 +253,16 @@ export function normalizeCodexOverrides(value) {
     if (typeof value.fastMode !== "boolean") throw new Error("codexOverrides.fastMode must be true or false");
     overrides.fastMode = value.fastMode;
   }
+  if (Object.hasOwn(value, "followUpMode")) {
+    if (typeof value.followUpMode !== "string") {
+      throw new Error("codexOverrides.followUpMode must be queue or steer");
+    }
+    const normalized = value.followUpMode.trim().toLowerCase();
+    if (!FOLLOW_UP_MODES.has(normalized)) {
+      throw new Error("codexOverrides.followUpMode must be queue or steer");
+    }
+    overrides.followUpMode = normalized;
+  }
   return overrides;
 }
 
@@ -255,5 +272,6 @@ function serializeCodexOverrides(overrides) {
       reasoningEffort: DISPLAY_REASONING_EFFORTS.get(overrides.reasoningEffort),
     } : {}),
     ...(Object.hasOwn(overrides, "fastMode") ? { fastMode: overrides.fastMode } : {}),
+    ...(Object.hasOwn(overrides, "followUpMode") ? { followUpMode: overrides.followUpMode } : {}),
   };
 }

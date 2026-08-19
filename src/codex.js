@@ -11,6 +11,7 @@ const REQUEST_TIMEOUT_MS = 30_000;
 const MACOS_CODEX_BIN = "/Applications/ChatGPT.app/Contents/Resources/codex";
 const PACKAGE_VERSION = createRequire(import.meta.url)("../package.json").version;
 const NATIVE_REASONING_EFFORTS = new Set(["low", "medium", "high", "xhigh", "max"]);
+const NATIVE_FOLLOW_UP_MODES = new Set(["queue", "steer"]);
 const DISPLAY_REASONING_EFFORT = new Map([
   ["low", "light"],
   ["medium", "medium"],
@@ -196,6 +197,7 @@ export class CodexAppServer extends EventEmitter {
         ...Object.entries(parity.performance)
           .filter(([, value]) => !value.verified)
           .map(([setting]) => `${setting} unverified`),
+        ...(!parity.followUpMode.verified ? ["followUpMode unverified"] : []),
       ];
       throw new Error(`Codex config parity check failed: ${Array.from(new Set(failures)).join(", ")}`);
     }
@@ -235,6 +237,10 @@ export class CodexAppServer extends EventEmitter {
     return summarizeConfig(this.effectiveConfig);
   }
 
+  followUpMode() {
+    return effectiveFollowUpMode(this.effectiveConfig);
+  }
+
   parityReport() {
     const config = this.effectiveConfig || {};
     const settings = this.threadSettings || {};
@@ -258,27 +264,31 @@ export class CodexAppServer extends EventEmitter {
     }
     const mismatches = checks.filter((check) => !check.matches).map((check) => check.setting);
     const performance = performanceReport(this.codexOverrides, config, settings, expectedPerformance);
+    const followUpMode = followUpModeReport(this.codexOverrides, config);
     const overriddenSettings = new Set([
       ...(Object.hasOwn(this.codexOverrides, "reasoningEffort") ? ["reasoningEffort"] : []),
       ...(Object.hasOwn(this.codexOverrides, "fastMode") ? ["serviceTier"] : []),
     ]);
     const inherited = Boolean(this.effectiveConfig && this.threadSettings
       && checks.filter((check) => !overriddenSettings.has(check.setting)).every((check) => check.matches));
-    const effectiveVerified = inherited && mismatches.length === 0 && performanceVerified(performance);
+    const effectiveVerified = inherited && mismatches.length === 0
+      && performanceVerified(performance) && followUpMode.verified;
     return {
       inherited,
       effectiveVerified,
       verified: effectiveVerified && unreported.length === 0,
       source: Object.keys(this.codexOverrides).length
-        ? "Codex native configuration with photon-codex performance overrides"
+        ? "Codex native configuration with photon-codex overrides"
         : "Codex native configuration",
       overrides: [
         ...(Object.hasOwn(this.codexOverrides, "reasoningEffort") ? ["reasoningEffort"] : []),
         ...(Object.hasOwn(this.codexOverrides, "fastMode") ? ["fastMode"] : []),
+        ...(Object.hasOwn(this.codexOverrides, "followUpMode") ? ["followUpMode"] : []),
       ],
       mismatches,
       unreported,
       performance,
+      followUpMode,
       config: this.configSummary(),
       thread: summarizeThreadSettings(settings),
     };
@@ -321,6 +331,12 @@ export function codexAppServerArgs(overrides = {}) {
   if (Object.hasOwn(overrides, "fastMode")) {
     if (typeof overrides.fastMode !== "boolean") throw new Error("Invalid Codex fast mode override");
     args.push("--config", `service_tier=${JSON.stringify(overrides.fastMode ? "fast" : "default")}`);
+  }
+  if (Object.hasOwn(overrides, "followUpMode")) {
+    if (!NATIVE_FOLLOW_UP_MODES.has(overrides.followUpMode)) {
+      throw new Error("Invalid Codex follow-up mode override");
+    }
+    args.push("--config", `desktop.followUpQueueMode=${JSON.stringify(overrides.followUpMode)}`);
   }
   return args;
 }
@@ -399,6 +415,26 @@ function performanceReport(overrides, config, settings, expected) {
 
 function performanceVerified(performance) {
   return Object.values(performance || {}).every((value) => value.verified);
+}
+
+function followUpModeReport(overrides, config) {
+  const overridden = Object.hasOwn(overrides, "followUpMode");
+  const raw = config.desktop?.followUpQueueMode ?? null;
+  const effective = effectiveFollowUpMode(config);
+  return {
+    source: overridden ? "override" : "native",
+    configured: overridden ? overrides.followUpMode : null,
+    effective,
+    configValue: raw,
+    verified: effective != null && (!overridden || raw === overrides.followUpMode),
+  };
+}
+
+function effectiveFollowUpMode(config = {}) {
+  const value = config.desktop?.followUpQueueMode;
+  if (value == null) return "steer";
+  if (value === "interrupt") return "steer";
+  return NATIVE_FOLLOW_UP_MODES.has(value) ? value : null;
 }
 
 function resumePerformanceParams(performance = {}) {

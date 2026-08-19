@@ -9,6 +9,7 @@ import { stdin, stdout } from "node:process";
 import { Bridge, snapshotFile } from "./bridge.js";
 import { CodexAppServer, codexExecutable, codexHome } from "./codex.js";
 import {
+  DEFAULT_CODEX_OVERRIDES,
   loadConfig,
   loadState,
   readProjectSecret,
@@ -67,7 +68,12 @@ async function init(args) {
     const defaultWorkspace = workspacePath();
     const cwd = flags.cwd || await rl.question(`Codex workspace [${defaultWorkspace}]: `) || defaultWorkspace;
     await mkdir(path.resolve(cwd), { recursive: true, mode: 0o700 });
-    const config = await saveConfig({ projectId, allowedSender, cwd: path.resolve(cwd) });
+    const config = await saveConfig({
+      projectId,
+      allowedSender,
+      cwd: path.resolve(cwd),
+      codexOverrides: DEFAULT_CODEX_OVERRIDES,
+    });
     print({ configured: true, config: redactConfig(config) });
     if (process.platform === "darwin") stdout.write("Next: photon-codex auth set\n");
     else stdout.write("Next: set PHOTON_PROJECT_SECRET, then run photon-codex doctor\n");
