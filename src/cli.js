@@ -2,11 +2,11 @@
 
 import { spawnSync } from "node:child_process";
 import { mkdir, readFile } from "node:fs/promises";
-import net from "node:net";
 import path from "node:path";
 import { createInterface } from "node:readline/promises";
 import { stdin, stdout } from "node:process";
 import { Bridge, snapshotFile } from "./bridge.js";
+import { controlRequest } from "./control.js";
 import { CodexAppServer, codexExecutable, codexHome } from "./codex.js";
 import {
   DEFAULT_CODEX_OVERRIDES,
@@ -21,6 +21,7 @@ import {
   workspacePath,
 } from "./config.js";
 import { logEvent } from "./log.js";
+import { safeErrorRecord } from "./errors.js";
 import {
   installService,
   restartService,
@@ -54,7 +55,12 @@ try {
   else if (command === "service" && args[0] === "uninstall") print(await uninstallService());
   else help(command === "help" || command === "--help" || command === "-h" ? 0 : 1);
 } catch (error) {
-  await logEvent("error", "cli_failed", { command, error: error.message });
+  const safe = safeErrorRecord("cli_failed", error);
+  await logEvent("error", "cli_failed", {
+    operation: command,
+    errorCategory: safe.category,
+    errorCode: safe.code,
+  });
   process.stderr.write(`photon-codex: ${error.message}\n`);
   process.exitCode = 1;
 }
@@ -288,29 +294,17 @@ async function control(command, body = {}) {
     if (command === "status") return offlineStatus(state, staleControl);
     throw new Error("bridge is not running");
   }
-  return new Promise((resolve, reject) => {
-    const socket = net.createConnection({ host: "127.0.0.1", port: state.control.port });
-    let response = "";
-    socket.setEncoding("utf8");
-    if (command !== "send-file") {
-      socket.setTimeout(3000, () => socket.destroy(new Error("control request timed out")));
-    }
-    socket.on("connect", () => socket.write(`${JSON.stringify({ token: state.control.token, command, ...body })}\n`));
-    socket.on("data", (chunk) => { response += chunk; });
-    socket.on("end", () => {
-      try {
-        const parsed = JSON.parse(response);
-        if (parsed.ok) resolve(parsed.result);
-        else reject(new Error(parsed.error));
-      } catch (error) {
-        reject(error);
-      }
+  try {
+    return await controlRequest({
+      port: state.control.port,
+      token: state.control.token,
+      command,
+      body,
     });
-    socket.on("error", (error) => {
-      if (command === "status" && ["ECONNREFUSED", "ECONNRESET"].includes(error.code)) resolve(offlineStatus(state, true));
-      else reject(error);
-    });
-  });
+  } catch (error) {
+    if (command === "status" && ["ECONNREFUSED", "ECONNRESET"].includes(error.code)) return offlineStatus(state, true);
+    throw error;
+  }
 }
 
 function offlineStatus(state, staleControl = false) {
@@ -363,7 +357,7 @@ function requiredText(value) {
 function help(exitCode) {
   stdout.write(`photon-codex
 
-  init [--project-id ID --sender +1555… --cwd PATH]
+  init [--project-id ID --sender E164_NUMBER --cwd PATH]
   auth set
   doctor
   run

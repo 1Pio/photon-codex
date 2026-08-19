@@ -1,12 +1,12 @@
 import assert from "node:assert/strict";
 import { existsSync } from "node:fs";
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import net from "node:net";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import {
   Bridge,
-  controlRequestLimit,
   normalizeMimeType,
   normalizePhone,
   normalizeReaction,
@@ -16,6 +16,12 @@ import {
   splitApprovalPrompt,
   splitMessage,
 } from "../src/bridge.js";
+import {
+  CONTROL_PREFACE_LIMIT,
+  controlRequest,
+  controlRequestLimit,
+  startControlServer,
+} from "../src/control.js";
 import {
   CodexAppServer,
   codexAppServerArgs,
@@ -34,12 +40,16 @@ import {
   saveConfig,
   saveState,
 } from "../src/config.js";
+import { safeErrorRecord } from "../src/errors.js";
 import { formatServerRequest, resolveServerRequest, supportsServerRequest } from "../src/interaction.js";
+import { logEvent } from "../src/log.js";
 import { launchAgentPlist } from "../src/service.js";
 
+const TEST_SENDER = `+${"9".repeat(11)}`;
+
 test("normalizes E.164 input without weakening validation", () => {
-  assert.equal(normalizeSender("+1 (555) 123-4567"), "+15551234567");
-  assert.equal(normalizePhone("+44 20 7946 0958"), "+442079460958");
+  assert.equal(normalizeSender(`+${"9".repeat(3)} (${"9".repeat(3)}) ${"9".repeat(3)}-${"9".repeat(3)}`), `+${"9".repeat(12)}`);
+  assert.equal(normalizePhone(`+${"8".repeat(2)} ${"8".repeat(4)} ${"8".repeat(4)}`), `+${"8".repeat(10)}`);
   assert.throws(() => normalizeSender("555-1234"));
 });
 
@@ -53,7 +63,7 @@ test("persists only transport configuration and the three explicit Codex overrid
   try {
     await saveConfig({
       projectId: "project",
-      allowedSender: "+15551234567",
+      allowedSender: TEST_SENDER,
       cwd: path.join(home, "workspace"),
       codexOverrides: {
         reasoningEffort: "extra high",
@@ -86,7 +96,7 @@ test("ignores legacy Codex overrides in Photon config", async () => {
   try {
     await writeFile(path.join(home, "config.json"), JSON.stringify({
       projectId: "project",
-      allowedSender: "+15551234567",
+      allowedSender: TEST_SENDER,
       cwd: path.join(home, "workspace"),
       reasoningEffort: "extra high",
       fastMode: true,
@@ -268,7 +278,7 @@ test("snapshots and fingerprints an outbound file before Spectrum reads it", asy
   try {
     await writeFile(file, original);
     const bridge = new Bridge({
-      config: { projectId: "project", allowedSender: "+15551234567", cwd: home, maxAttachmentBytes: 1024 },
+      config: { projectId: "project", allowedSender: TEST_SENDER, cwd: home, maxAttachmentBytes: 1024 },
       projectSecret: "secret",
     });
     bridge.state = { ...emptyState(), spaceId: "space-1" };
@@ -320,7 +330,7 @@ test("fails outbound files closed on size and missing provider receipts", async 
     const file = path.join(home, "too-large.bin");
     await writeFile(file, "12345");
     const bridge = new Bridge({
-      config: { projectId: "project", allowedSender: "+15551234567", cwd: home, maxAttachmentBytes: 4 },
+      config: { projectId: "project", allowedSender: TEST_SENDER, cwd: home, maxAttachmentBytes: 4 },
       projectSecret: "secret",
     });
     bridge.state = { ...emptyState(), spaceId: "space-1" };
@@ -354,7 +364,7 @@ test("keeps path reads in the caller and validates the loopback byte envelope", 
     const boundary = path.join(home, "boundary.txt");
     await writeFile(boundary, "1234");
     const bridge = new Bridge({
-      config: { projectId: "project", allowedSender: "+15551234567", cwd: home, maxAttachmentBytes: 4 },
+      config: { projectId: "project", allowedSender: TEST_SENDER, cwd: home, maxAttachmentBytes: 4 },
       projectSecret: "secret",
     });
     bridge.state = { ...emptyState(), spaceId: "space-1" };
@@ -393,10 +403,126 @@ test("keeps path reads in the caller and validates the loopback byte envelope", 
   }
 });
 
+test("authenticates the bounded control preface before accepting a framed attachment body", async () => {
+  const token = "test-control-token";
+  const received = [];
+  const server = await startControlServer({
+    token,
+    maxAttachmentBytes: 4,
+    idleTimeoutMs: 40,
+    maxConnections: 4,
+    handle: async (request) => {
+      received.push(request);
+      return { accepted: request.command === "send-file", size: request.size };
+    },
+  });
+  const port = server.address().port;
+  let held;
+  let boundServer;
+  try {
+    const unauthorized = await rawControl(port, `${JSON.stringify({ token: "wrong", command: "status", bodyBytes: 2 })}\n`);
+    assert.match(unauthorized, /unauthorized/);
+    assert.equal(received.length, 0);
+
+    const oversized = await rawControl(port, `${JSON.stringify({ token, command: "send-file", bodyBytes: controlRequestLimit(4) + 1 })}\n`);
+    assert.match(oversized, /exceeds the command limit/);
+    assert.equal(received.length, 0);
+
+    const malformed = await rawControl(port, "not-json\n");
+    assert.match(malformed, /preface is malformed/);
+    const longPreface = await rawControl(port, "x".repeat(CONTROL_PREFACE_LIMIT + 1));
+    assert.match(longPreface, /preface is too large/);
+    const earlyBody = await rawControl(port, `${JSON.stringify({ token, command: "status", bodyBytes: 2 })}\n{}`);
+    assert.match(earlyBody, /before authentication/);
+    const malformedBody = await framedControl(port, token, "status", Buffer.from("xx"));
+    assert.match(malformedBody, /body is malformed/);
+    const overlongBody = await framedControl(port, token, "status", Buffer.from("{}x"), 2);
+    assert.match(overlongBody, /exceeds declared length/);
+
+    const stalled = await rawControl(port, "");
+    assert.match(stalled, /connection timed out/);
+
+    const attachment = {
+      data: Buffer.from("test").toString("base64"),
+      size: 4,
+      sha256: "0".repeat(64),
+      mimeType: "application/octet-stream",
+      name: "test.bin",
+    };
+    assert.deepEqual(await controlRequest({ port, token, command: "send-file", body: attachment }), {
+      accepted: true,
+      size: 4,
+    });
+    assert.deepEqual(received, [{ command: "send-file", ...attachment }]);
+
+    boundServer = await startControlServer({
+      token,
+      maxAttachmentBytes: 4,
+      idleTimeoutMs: 1000,
+      maxConnections: 1,
+      handle: async () => ({}),
+    });
+    held = net.createConnection({ host: "127.0.0.1", port: boundServer.address().port });
+    await new Promise((resolve, reject) => {
+      held.once("connect", resolve);
+      held.once("error", reject);
+    });
+    const bounded = await rawControl(boundServer.address().port, `${JSON.stringify({ token, command: "status", bodyBytes: 2 })}\n`);
+    assert.match(bounded, /connection limit reached/);
+  } finally {
+    held?.destroy();
+    boundServer?.destroyControlConnections();
+    if (boundServer) await new Promise((resolve) => boundServer.close(resolve));
+    server.destroyControlConnections();
+    await new Promise((resolve) => server.close(resolve));
+  }
+});
+
+test("persists only allowlisted content-free log and last-error fields", async () => {
+  const home = await mkdtemp(path.join(os.tmpdir(), "photon-codex-safe-log-"));
+  const env = { PHOTON_CODEX_HOME: home };
+  const hostile = {
+    credential: ["credential", "material"].join("-"),
+    phone: `+${"7".repeat(12)}`,
+    id: ["private", "identifier", "value"].join("-"),
+    path: ["", "Users", "person", "private", "workspace"].join("/"),
+    command: ["print", "private", "command"].join(" "),
+    diff: ["+private", "-content"].join("\n"),
+    message: ["private", "message", "body"].join(" "),
+  };
+  const error = new Error(Object.values(hostile).join(" | "));
+  const safe = safeErrorRecord("message_failed", error);
+  try {
+    await logEvent("error", "message_failed", {
+      contentType: "text",
+      errorCategory: safe.category,
+      errorCode: safe.code,
+      ...hostile,
+    }, env);
+    await logEvent("error", hostile.message, hostile, env);
+
+    const state = emptyState();
+    state.runtime.lastError = { ...safe, detail: Object.values(hostile).join(" | ") };
+    await saveState(state, env);
+    const storedLog = await readFile(path.join(home, "runtime.log"), "utf8");
+    const storedState = await readFile(path.join(home, "state.json"), "utf8");
+    for (const value of Object.values(hostile)) {
+      assert.equal(storedLog.includes(value), false);
+      assert.equal(storedState.includes(value), false);
+    }
+    const entries = storedLog.trim().split("\n").map(JSON.parse);
+    assert.deepEqual(Object.keys(entries[0]).sort(), ["contentType", "errorCategory", "errorCode", "event", "level", "time"]);
+    assert.equal(entries[1].event, "log_event_rejected");
+    assert.deepEqual((await loadState(env)).runtime.lastError, safe);
+  } finally {
+    await rm(home, { recursive: true, force: true });
+  }
+});
+
 test("normalizes aliases and requires a provider receipt for direct reactions", async () => {
   const seen = [];
   const bridge = new Bridge({
-    config: { projectId: "project", allowedSender: "+15551234567", cwd: "/tmp", maxAttachmentBytes: 1024 },
+    config: { projectId: "project", allowedSender: TEST_SENDER, cwd: "/tmp", maxAttachmentBytes: 1024 },
     projectSecret: "secret",
     logger: async () => {},
   });
@@ -426,7 +552,7 @@ test("ignores Photon read receipts before starting a Codex turn", async () => {
     const bridge = new Bridge({
       config: {
         projectId: "project",
-        allowedSender: "+15551234567",
+        allowedSender: TEST_SENDER,
         cwd: home,
         maxAttachmentBytes: 1024,
       },
@@ -450,7 +576,7 @@ test("ignores Photon read receipts before starting a Codex turn", async () => {
     const receipt = {
       id: "message-1:read:1",
       direction: "inbound",
-      sender: { id: "+15551234567" },
+      sender: { id: TEST_SENDER },
       timestamp: new Date("2026-08-18T18:14:01.093Z"),
       content: { type: "read", target: { direction: "outbound" } },
       read: async () => {},
@@ -475,7 +601,7 @@ test("accepts one user message and records one successful reply", async () => {
     const bridge = new Bridge({
       config: {
         projectId: "project",
-        allowedSender: "+15551234567",
+        allowedSender: TEST_SENDER,
         cwd: home,
         maxAttachmentBytes: 1024,
       },
@@ -500,7 +626,7 @@ test("accepts one user message and records one successful reply", async () => {
     const message = {
       id: "message-1",
       direction: "inbound",
-      sender: { id: "+15551234567" },
+      sender: { id: TEST_SENDER },
       timestamp: new Date("2026-08-19T00:00:00.000Z"),
       content: { type: "text", text: "hello" },
       read: async () => {},
@@ -535,7 +661,7 @@ test("a failed reaction never suppresses the answer text", async () => {
   let attempts = 0;
   try {
     const bridge = new Bridge({
-      config: { projectId: "project", allowedSender: "+15551234567", cwd: home, maxAttachmentBytes: 1024 },
+      config: { projectId: "project", allowedSender: TEST_SENDER, cwd: home, maxAttachmentBytes: 1024 },
       projectSecret: "secret",
       env: { ...process.env, PHOTON_CODEX_HOME: home },
       logger: async (level, event) => events.push({ level, event }),
@@ -570,7 +696,7 @@ test("a commentary reaction is sent once before the final answer", async () => {
   const replies = [];
   try {
     const bridge = new Bridge({
-      config: { projectId: "project", allowedSender: "+15551234567", cwd: home, maxAttachmentBytes: 1024 },
+      config: { projectId: "project", allowedSender: TEST_SENDER, cwd: home, maxAttachmentBytes: 1024 },
       projectSecret: "secret",
       env: { ...process.env, PHOTON_CODEX_HOME: home },
       logger: async () => {},
@@ -612,7 +738,7 @@ test("a failed reaction-only response falls back to visible emoji text", async (
   let fallback;
   try {
     const bridge = new Bridge({
-      config: { projectId: "project", allowedSender: "+15551234567", cwd: home, maxAttachmentBytes: 1024 },
+      config: { projectId: "project", allowedSender: TEST_SENDER, cwd: home, maxAttachmentBytes: 1024 },
       projectSecret: "secret",
       env: { ...process.env, PHOTON_CODEX_HOME: home },
       logger: async () => {},
@@ -645,7 +771,7 @@ test("accepts and unwraps a threaded iMessage reply", async () => {
   try {
     const inputs = [];
     const bridge = new Bridge({
-      config: { projectId: "project", allowedSender: "+15551234567", cwd: home, maxAttachmentBytes: 1024 },
+      config: { projectId: "project", allowedSender: TEST_SENDER, cwd: home, maxAttachmentBytes: 1024 },
       projectSecret: "secret",
       env: { ...process.env, PHOTON_CODEX_HOME: home },
       logger: async () => {},
@@ -661,7 +787,7 @@ test("accepts and unwraps a threaded iMessage reply", async () => {
     const message = {
       id: "reply-1",
       direction: "inbound",
-      sender: { id: "+15551234567" },
+      sender: { id: TEST_SENDER },
       content: {
         type: "reply",
         target: { id: "prompt-1" },
@@ -686,7 +812,7 @@ test("never applies a late threaded answer to the current Codex prompt", async (
     let responses = 0;
     const replies = [];
     const bridge = new Bridge({
-      config: { projectId: "project", allowedSender: "+15551234567", cwd: home, maxAttachmentBytes: 1024 },
+      config: { projectId: "project", allowedSender: TEST_SENDER, cwd: home, maxAttachmentBytes: 1024 },
       projectSecret: "secret",
       env: { ...process.env, PHOTON_CODEX_HOME: home },
       logger: async () => {},
@@ -705,7 +831,7 @@ test("never applies a late threaded answer to the current Codex prompt", async (
     const message = {
       id: "late-reply",
       direction: "inbound",
-      sender: { id: "+15551234567" },
+      sender: { id: TEST_SENDER },
       content: {
         type: "reply",
         target: { id: "closed-prompt" },
@@ -734,7 +860,7 @@ test("honors the Codex desktop follow-up queue setting", async () => {
     const bridge = new Bridge({
       config: {
         projectId: "project",
-        allowedSender: "+15551234567",
+        allowedSender: TEST_SENDER,
         cwd: home,
         maxAttachmentBytes: 1024,
       },
@@ -762,7 +888,7 @@ test("honors the Codex desktop follow-up queue setting", async () => {
     const message = {
       id: "message-queued",
       direction: "inbound",
-      sender: { id: "+15551234567" },
+      sender: { id: TEST_SENDER },
       timestamp: new Date("2026-08-19T00:00:00.000Z"),
       content: { type: "text", text: "next request" },
       read: async () => {},
@@ -794,7 +920,7 @@ test("steers an active Codex turn when the effective follow-up mode is steer", a
     const bridge = new Bridge({
       config: {
         projectId: "project",
-        allowedSender: "+15551234567",
+        allowedSender: TEST_SENDER,
         cwd: home,
         maxAttachmentBytes: 1024,
       },
@@ -817,7 +943,7 @@ test("steers an active Codex turn when the effective follow-up mode is steer", a
     const message = {
       id: "message-steered",
       direction: "inbound",
-      sender: { id: "+15551234567" },
+      sender: { id: TEST_SENDER },
       timestamp: new Date("2026-08-19T00:00:00.000Z"),
       content: { type: "text", text: "adjust the active turn" },
       read: async () => {},
@@ -840,7 +966,7 @@ test("status reports native Codex config parity without Photon overrides", () =>
   const bridge = new Bridge({
     config: {
       projectId: "project",
-      allowedSender: "+15551234567",
+      allowedSender: TEST_SENDER,
       cwd: "/tmp",
       maxAttachmentBytes: 1024,
     },
@@ -1329,7 +1455,7 @@ test("fails closed for secret questions, unscoped file approvals, and unsupporte
 
 test("captures exact file changes from the always-on item lifecycle", async () => {
   const bridge = new Bridge({
-    config: { projectId: "project", allowedSender: "+15551234567", cwd: "/tmp", maxAttachmentBytes: 1024 },
+    config: { projectId: "project", allowedSender: TEST_SENDER, cwd: "/tmp", maxAttachmentBytes: 1024 },
     projectSecret: "secret",
   });
   const changes = [{ path: "/tmp/file.txt", kind: "update", diff: "+hello" }];
@@ -1506,4 +1632,48 @@ function inheritedThread(id) {
       excludeSlashTmp: false,
     },
   };
+}
+
+function rawControl(port, payload) {
+  return new Promise((resolve, reject) => {
+    const socket = net.createConnection({ host: "127.0.0.1", port });
+    let output = "";
+    socket.setEncoding("utf8");
+    socket.setTimeout(1000, () => socket.destroy(new Error("test control request timed out")));
+    socket.on("connect", () => {
+      if (payload) socket.write(payload);
+    });
+    socket.on("data", (chunk) => { output += chunk; });
+    socket.on("end", () => {
+      socket.destroy();
+      resolve(output);
+    });
+    socket.on("error", reject);
+  });
+}
+
+function framedControl(port, token, command, body, declaredBytes = body.byteLength) {
+  return new Promise((resolve, reject) => {
+    const socket = net.createConnection({ host: "127.0.0.1", port });
+    let output = "";
+    let ready = false;
+    socket.setEncoding("utf8");
+    socket.setTimeout(1000, () => socket.destroy(new Error("test framed request timed out")));
+    socket.on("connect", () => {
+      socket.write(`${JSON.stringify({ token, command, bodyBytes: declaredBytes })}\n`);
+    });
+    socket.on("data", (chunk) => {
+      output += chunk;
+      if (!ready && output.includes("\n")) {
+        ready = true;
+        output = "";
+        socket.write(body);
+      }
+    });
+    socket.on("end", () => {
+      socket.destroy();
+      resolve(output);
+    });
+    socket.on("error", reject);
+  });
 }

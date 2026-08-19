@@ -1,5 +1,18 @@
 node_modules/
 .env
+.env.*
+!.env.example
+.npmrc
 .photon-codex/
 .DS_Store
 npm-debug.log*
+*.tgz
+*.tar.gz
+
+# Runtime files if PHOTON_CODEX_HOME points at the repository root.
+/config.json
+/state.json
+/runtime.log
+/runtime.log.1
+/attachments/
+/workspace/

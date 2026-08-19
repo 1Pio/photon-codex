@@ -2,6 +2,7 @@ import { execFileSync, spawnSync } from "node:child_process";
 import { chmod, mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import { normalizeSafeErrorRecord } from "./errors.js";
 
 const KEYCHAIN_SERVICE = "photon-codex";
 const REASONING_EFFORTS = new Map([
@@ -71,7 +72,7 @@ async function writeJson(file, value) {
 export function normalizeSender(value) {
   const normalized = String(value || "").replace(/[\s()-]/g, "");
   if (!/^\+[1-9]\d{7,14}$/.test(normalized)) {
-    throw new Error("allowedSender must be an E.164 phone number such as +15551234567");
+    throw new Error("allowedSender must start with + and contain 8 to 15 digits");
   }
   return normalized;
 }
@@ -159,6 +160,7 @@ export function normalizeState(state = {}) {
   const acceptedMessageIds = state.acceptedMessageIds || legacyIds.filter((id) => !isReceiptEventId(id));
   const ignoredEventIds = state.ignoredEventIds || legacyReceipts;
   const runtime = { ...defaults.runtime, ...(state.runtime || {}) };
+  runtime.lastError = normalizeSafeErrorRecord(runtime.lastError);
   if (!state.runtime) {
     runtime.acceptedMessages = acceptedMessageIds.length;
     runtime.ignoredEvents = ignoredEventIds.length;

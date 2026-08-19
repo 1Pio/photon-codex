@@ -1,11 +1,12 @@
 import { createHash, randomBytes } from "node:crypto";
 import { mkdir, open, writeFile } from "node:fs/promises";
-import net from "node:net";
 import path from "node:path";
 import { Spectrum, attachment, markdown, text } from "@spectrum-ts/core";
 import { imessage } from "@spectrum-ts/imessage";
 import { attachmentsPath, loadState, saveState } from "./config.js";
 import { CodexAppServer } from "./codex.js";
+import { startControlServer } from "./control.js";
+import { safeErrorRecord } from "./errors.js";
 import { formatServerRequest, resolveServerRequest, supportsServerRequest } from "./interaction.js";
 import { logEvent } from "./log.js";
 
@@ -80,13 +81,12 @@ export class Bridge {
     });
     this.codex.on("request", (request) => {
       void this.#handleCodexRequest(request).catch((error) => {
-        void this.#recordError("codex_request_failed", error, { method: request.method });
+        void this.#recordError("codex_request_failed", error);
       });
     });
     this.codex.on("notification", (method, params) => {
       void this.handleCodexNotification(method, params).catch((error) => {
-        process.stderr.write(`Codex event ${method} failed: ${error.message}\n`);
-        void this.#recordError("codex_notification_failed", error, { method });
+        void this.#recordError("codex_notification_failed", error, { failedReply: method === "turn/completed" });
       });
     });
     this.codex.on("exit", (error) => {
@@ -117,6 +117,7 @@ export class Bridge {
         state.runtime.stoppedAt = new Date().toISOString();
       });
     }
+    this.controlServer?.destroyControlConnections?.();
     await new Promise((resolve) => this.controlServer?.close(resolve) || resolve());
     await this.codex?.stop();
     await this.spectrum?.stop();
@@ -135,8 +136,6 @@ export class Bridge {
     const metadata = sent.attachmentMetadata?.[0];
     await this.logger("info", "file_sent", {
       size: snapshot.bytes.byteLength,
-      requestedMimeType: resolvedMimeType,
-      providerMimeType: metadata?.mimeType ?? null,
       providerDelivered: sent.isDelivered === true,
     }, this.env);
     return {
@@ -233,7 +232,6 @@ export class Bridge {
       await this.#recordAccepted(message.id, disposition.contentType);
     } catch (error) {
       await space.stopTyping().catch(() => {});
-      process.stderr.write(`message ${message.id} failed: ${error.message}\n`);
       await this.#recordError("message_failed", error, { contentType: disposition.contentType });
     }
   }
@@ -309,7 +307,7 @@ export class Bridge {
         return;
       }
       this.codex.reject(request.id, `photon-codex does not provide the host capability required by ${request.method}`);
-      await this.logger("warn", "codex_request_unsupported", { method: request.method }, this.env);
+      await this.logger("warn", "codex_request_unsupported", {}, this.env);
       return;
     }
     const autoResolutionMs = Number(request.params?.autoResolutionMs || 0);
@@ -457,41 +455,22 @@ export class Bridge {
       state.messageId = sent.id;
       await this.logger("info", "reaction_sent", { phase }, this.env);
     } catch (error) {
-      await this.logger("warn", "reaction_failed", { phase, error: cleanError(error) }, this.env);
+      const safe = safeErrorRecord("reaction_failed", error);
+      await this.logger("warn", "reaction_failed", {
+        phase,
+        errorCategory: safe.category,
+        errorCode: safe.code,
+      }, this.env);
     }
     return state;
   }
 
   async #startControlServer() {
     const token = randomBytes(24).toString("base64url");
-    this.controlServer = net.createServer((socket) => {
-      let buffer = "";
-      let receivedBytes = 0;
-      let settled = false;
-      socket.setEncoding("utf8");
-      socket.on("data", (chunk) => {
-        if (settled) return;
-        receivedBytes += Buffer.byteLength(chunk);
-        if (receivedBytes > controlRequestLimit(this.config.maxAttachmentBytes)) {
-          settled = true;
-          socket.end(`${JSON.stringify({ ok: false, error: "control request exceeds the configured attachment limit" })}\n`);
-          return;
-        }
-        buffer += chunk;
-        const newline = buffer.indexOf("\n");
-        if (newline === -1) return;
-        const line = buffer.slice(0, newline);
-        buffer = "";
-        settled = true;
-        void this.#handleControl(line).then(
-          (result) => socket.end(`${JSON.stringify({ ok: true, result })}\n`),
-          (error) => socket.end(`${JSON.stringify({ ok: false, error: error.message })}\n`),
-        );
-      });
-    });
-    await new Promise((resolve, reject) => {
-      this.controlServer.once("error", reject);
-      this.controlServer.listen(0, "127.0.0.1", resolve);
+    this.controlServer = await startControlServer({
+      token,
+      maxAttachmentBytes: this.config.maxAttachmentBytes,
+      handle: (request) => this.#handleControl(request),
     });
     const address = this.controlServer.address();
     this.controlToken = token;
@@ -500,9 +479,7 @@ export class Bridge {
     });
   }
 
-  async #handleControl(line) {
-    const request = JSON.parse(line);
-    if (request.token !== this.controlToken) throw new Error("unauthorized");
+  async #handleControl(request) {
     if (request.command === "status") return this.status();
     if (request.command === "stop") {
       setImmediate(() => void this.stop().then(() => process.exit(0)));
@@ -617,15 +594,19 @@ export class Bridge {
   }
 
   async #recordError(event, error, details = {}) {
-    const message = cleanError(error);
+    const record = safeErrorRecord(event, error);
     if (this.state) {
       await this.#updateState((state) => {
-        state.runtime.lastError = message;
+        state.runtime.lastError = record;
         state.runtime.lastErrorAt = new Date().toISOString();
-        if (event === "codex_notification_failed" && details.method === "turn/completed") state.runtime.repliesFailed += 1;
+        if (event === "codex_notification_failed" && details.failedReply) state.runtime.repliesFailed += 1;
       });
     }
-    await this.logger("error", event, { ...details, error: message }, this.env);
+    await this.logger("error", event, {
+      ...details,
+      errorCategory: record.category,
+      errorCode: record.code,
+    }, this.env);
   }
 
   async #updateState(update) {
@@ -822,10 +803,6 @@ function decodeAttachmentData(data, claimedSize, claimedSha256, maxBytes) {
     throw new Error("attachment SHA-256 does not match the caller snapshot");
   }
   return { bytes, sha256 };
-}
-
-export function controlRequestLimit(maxAttachmentBytes) {
-  return Math.ceil(maxAttachmentBytes / 3) * 4 + 16 * 1024;
 }
 
 function requireProviderReceipt(message, kind) {
