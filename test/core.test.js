@@ -2451,6 +2451,7 @@ test("resumes persisted threads with app-server-resolved native performance valu
   assert.equal(request.method, "thread/resume");
   assert.deepEqual(request.params, {
     threadId: "thread-1",
+    excludeTurns: true,
     cwd: "/tmp",
     serviceTier: "priority",
     config: { model_reasoning_effort: "xhigh" },
@@ -2518,6 +2519,7 @@ test("restart resumes the same overridden thread and later turns inherit the pro
   assert.deepEqual(requests.map(({ method }) => method), ["thread/resume", "turn/start"]);
   assert.deepEqual(requests[0].params, {
     threadId: "thread-1",
+    excludeTurns: true,
     cwd: "/tmp",
     serviceTier: "priority",
     config: { model_reasoning_effort: "xhigh" },

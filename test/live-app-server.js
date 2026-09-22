@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { randomUUID } from "node:crypto";
 import test from "node:test";
 import { CodexAppServer } from "../src/codex.js";
 
@@ -98,7 +99,8 @@ test("live app-server updates one resumed thread after restart and keeps later t
     threadIds.add(threadId);
     assert.equal(created.parityReport().effectiveVerified, true);
     assert.equal(created.parityReport().followUpMode.effective, "queue");
-    const initialTurn = await completedTurn(created, "Reply with exactly PHOTON_CODEX_OVERRIDE_INITIAL_OK and nothing else.");
+    const contextToken = `PHOTON_CONTEXT_${randomUUID().replaceAll("-", "")}`;
+    const initialTurn = await completedTurn(created, `Remember this token for the next turn: ${contextToken}. Reply with exactly PHOTON_CODEX_OVERRIDE_INITIAL_OK and nothing else.`);
     assert.equal(initialTurn?.status, "completed");
     await created.stop();
 
@@ -112,8 +114,9 @@ test("live app-server updates one resumed thread after restart and keeps later t
     threadIds.add(resumed.threadId);
     assert.equal(resumed.threadId, threadId);
     assert.equal(resumed.parityReport().effectiveVerified, true);
-    const turn = await completedTurn(resumed, "Reply with exactly PHOTON_CODEX_OVERRIDE_LIVE_OK and nothing else.");
+    const turn = await completedTurn(resumed, "Reply with exactly the token I asked you to remember in the previous turn, and nothing else.");
     assert.equal(turn?.status, "completed");
+    assert.equal(turn.assistantText.trim(), contextToken);
     const parity = resumed.parityReport();
     assert.equal(parity.effectiveVerified, true);
     assert.equal(parity.performance.reasoningEffort.thread, "xhigh");
@@ -151,12 +154,16 @@ async function withServer(codexOverrides, verify) {
 
 async function completedTurn(server, prompt) {
   let timer;
+  let onNotification;
+  const assistantMessages = new Map();
   const completed = new Promise((resolve, reject) => {
     timer = setTimeout(() => reject(new Error("live Codex turn timed out")), 120_000);
-    const onNotification = (method, params) => {
+    onNotification = (method, params) => {
+      if (method === "item/completed" && params.item?.type === "agentMessage") {
+        assistantMessages.set(params.item.id, params.item.text);
+      }
       if (method !== "turn/completed") return;
-      server.off("notification", onNotification);
-      resolve(params.turn);
+      resolve({ ...params.turn, assistantText: [...assistantMessages.values()].join("\n") });
     };
     server.on("notification", onNotification);
   });
@@ -165,5 +172,6 @@ async function completedTurn(server, prompt) {
     return await completed;
   } finally {
     clearTimeout(timer);
+    server.off("notification", onNotification);
   }
 }

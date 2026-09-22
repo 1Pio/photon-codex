@@ -51,19 +51,18 @@ export class CodexAppServer extends EventEmitter {
       stdio: ["pipe", "pipe", "pipe"],
     });
     this.process.once("error", (error) => {
-      for (const pending of this.pending.values()) pending.reject(error);
-      this.pending.clear();
+      this.#rejectPending(error);
       if (!this.stopping) this.emit("exit", error);
       this.process = null;
     });
     this.process.once("exit", (code, signal) => {
       const error = new Error(`codex app-server exited (${code ?? signal})`);
-      for (const pending of this.pending.values()) pending.reject(error);
-      this.pending.clear();
+      this.#rejectPending(error);
       if (!this.stopping) this.emit("exit", error);
       this.process = null;
     });
     if (this.env.PHOTON_CODEX_DEBUG === "1") this.process.stderr.pipe(process.stderr);
+    else this.process.stderr.resume();
     readline.createInterface({ input: this.process.stdout }).on("line", (line) => this.#onLine(line));
     await this.request("initialize", {
       clientInfo: { name: "photon-codex", title: "Photon Codex", version: PACKAGE_VERSION },
@@ -139,6 +138,14 @@ export class CodexAppServer extends EventEmitter {
     this.process.stdin.write(`${JSON.stringify(message)}\n`);
   }
 
+  #rejectPending(error) {
+    for (const pending of this.pending.values()) {
+      clearTimeout(pending.timer);
+      pending.reject(error);
+    }
+    this.pending.clear();
+  }
+
   notify(method, params) {
     this.#write({ jsonrpc: "2.0", method, params });
   }
@@ -159,7 +166,13 @@ export class CodexAppServer extends EventEmitter {
         reject(new Error(`${method} timed out`));
       }, timeoutMs);
       this.pending.set(id, { resolve, reject, timer, method });
-      this.#write({ jsonrpc: "2.0", id, method, params });
+      try {
+        this.#write({ jsonrpc: "2.0", id, method, params });
+      } catch (error) {
+        clearTimeout(timer);
+        this.pending.delete(id);
+        reject(error);
+      }
     });
   }
 
@@ -168,6 +181,9 @@ export class CodexAppServer extends EventEmitter {
     try {
       const result = await this.request("thread/resume", {
         threadId: this.threadId,
+        // The backend restores model context; the bridge only needs metadata
+        // and future events, not the task's entire display history.
+        excludeTurns: true,
         cwd: this.cwd,
         ...resumePerformanceParams(effectivePerformance(this.effectiveConfig, this.modelPerformanceDefaults)),
       });

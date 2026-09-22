@@ -167,6 +167,8 @@ Sent means Photon accepted the message, not that the recipient saw it.
 
 Run `npm test` for the unit tests. Run `npm run test:live` to test against your authenticated Codex app-server.
 
+Startup resumes the existing task with `excludeTurns: true`. Codex restores its model context, while the bridge receives metadata and subscribes to future events without downloading the entire conversation history. This keeps long-running tasks from timing out during history hydration. Request deadlines remain bounded; backend exit cancels pending requests and their timers. Backend stderr is drained even when debug logging is off.
+
 Protocol references: [Codex app-server](https://learn.chatgpt.com/docs/app-server), [Spectrum edits, reactions, and replies](https://photon.codes/docs/spectrum-ts/reactions-and-replies), [Spectrum voice messages](https://photon.codes/docs/spectrum-ts/content/voice), [ElevenLabs speech to text](https://elevenlabs.io/docs/api-reference/speech-to-text/convert), [ElevenLabs text to speech](https://elevenlabs.io/docs/api-reference/text-to-speech/convert), and [Apple's iMessage edit limits](https://support.apple.com/en-ae/guide/iphone/iphe67195653/ios).
 
 MIT licensed. photon-codex is independent and is not affiliated with Photon, OpenAI, Apple, or ElevenLabs. Their names and marks belong to their owners.
